@@ -250,7 +250,7 @@ class ProxyService
         $defaultPort = config('proxy.target.port', 3307);
 
         $host = $context->getTargetHost() !== null ? $context->getTargetHost() : $defaultHost;
-        $port = $context->getTargetPort() !== null ? $context->getTargetPort() : $defaultPort;
+        $port = (int) ($context->getTargetPort() !== null ? $context->getTargetPort() : $defaultPort);
 
         $socket = new Socket(AF_INET, SOCK_STREAM, 0);
         $socket->connect($host, $port);

@@ -8,7 +8,7 @@ use App\Exception\ProxyException;
 
 class Auth
 {
-    public const CAPABILITIES = 0x00a080df;
+    public const CAPABILITIES = 0x000880df;
     private const MAX_PACKET_SIZE = 0xffffff;
 
     public static function generateAuthData(int $length = 20): string

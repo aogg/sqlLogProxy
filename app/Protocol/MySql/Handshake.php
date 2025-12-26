@@ -9,7 +9,7 @@ class Handshake
     public const PROTOCOL_VERSION = 10;
     private const SERVER_VERSION = '5.7.0-sqlLogProxy';
     private const CHARSET = 33; // utf8mb4_general_ci
-    private const CAPABILITIES = 0x00a080df;
+    private const CAPABILITIES = 0x000880df;
 
     public static function parseServerHandshake(Packet $packet): array
     {

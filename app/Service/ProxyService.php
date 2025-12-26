@@ -41,8 +41,6 @@ class ProxyService
         $this->logPath = isset($config['log']['path']) ? $config['log']['path'] : BASE_PATH . '/runtime';
         $this->sqlHighlight = isset($config['log']['sql_highlight']) ? $config['log']['sql_highlight'] : true;
         $this->excludePatterns = isset($config['filters']['exclude_patterns']) ? $config['filters']['exclude_patterns'] : [];
-
-        \App\Helpers\LogHelper::init($this->logPath);
     }
 
     public function onConnect(\Swoole\Server $server, int $fd, int $reactorId): void
@@ -200,16 +198,6 @@ class ProxyService
                 'elapsed_ms' => $elapsedMs,
                 'affected_rows' => $affectedRows,
             ]);
-
-            \App\Helpers\LogHelper::writeLog(
-                (string) $context,
-                $sql,
-                $group,
-                $transactionId,
-                $elapsedMs,
-                $affectedRows,
-                $this->sqlHighlight
-            );
         }
     }
 
@@ -260,16 +248,6 @@ class ProxyService
                 'transaction_id' => $transactionId,
                 'statement_id' => $stmtId,
             ]);
-
-            \App\Helpers\LogHelper::writeLog(
-                (string) $context,
-                "[EXECUTE] " . $sql,
-                $group,
-                $transactionId,
-                0,
-                0,
-                $this->sqlHighlight
-            );
         }
 
         $this->forwardToTarget($server, $context, $packet);

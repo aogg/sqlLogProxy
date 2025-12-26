@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Src\Protocol;
+namespace App\Protocol;
 
 use Swoole\Coroutine\Socket;
 
@@ -62,6 +62,9 @@ class ConnectionContext
 
     public function getTransactionId(): string
     {
+        if (!$this->inTransaction) {
+            return '';
+        }
         if (!$this->transactionId) {
             $this->transactionId = uniqid('txn_', true);
         }

@@ -11,8 +11,8 @@ use Hyperf\Context\ApplicationContext;
 use Psr\Container\ContainerInterface;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Socket;
-use Src\Protocol\ConnectionContext;
-use Src\Protocol\MySql\{Auth, Command, Handshake, Packet, Parser, Prepare, Query, Response};
+use App\Protocol\ConnectionContext;
+use App\Protocol\MySql\{Auth, Command, Handshake, Packet, Parser, Prepare, Query, Response};
 use function Hyperf\Config\config;
 
 class ProxyService

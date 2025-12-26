@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Src\Protocol\MySql;
+namespace App\Protocol\MySql;
 
 class Prepare
 {

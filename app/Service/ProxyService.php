@@ -8,7 +8,9 @@ use App\Helpers\SqlHelper;
 use App\Helpers\WildcardHelper;
 use Hyperf\Config\Annotation\Value;
 use Hyperf\Context\ApplicationContext;
+use Hyperf\Logger\LoggerFactory;
 use Psr\Container\ContainerInterface;
+use Psr\Log\LoggerInterface;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Socket;
 use App\Protocol\ConnectionContext;
@@ -23,12 +25,16 @@ class ProxyService
     private bool $sqlHighlight;
     private array $excludePatterns;
     private array $connections = [];
-    private \Psr\Log\LoggerInterface $logger;
+    private LoggerInterface $logger;
+    private LoggerInterface $sqlLogger;
+    private LoggerInterface $connectionLogger;
 
-    public function __construct(ContainerInterface $container, \Psr\Log\LoggerInterface $logger)
+    public function __construct(ContainerInterface $container, LoggerFactory $loggerFactory)
     {
         $this->container = $container;
-        $this->logger = $logger;
+        $this->logger = $loggerFactory->get('default');
+        $this->sqlLogger = $loggerFactory->get('sql');
+        $this->connectionLogger = $loggerFactory->get('connection');
         $config = config('proxy', []);
 
         $this->logEnabled = isset($config['log']['enabled']) ? $config['log']['enabled'] : true;
@@ -148,8 +154,18 @@ class ProxyService
     {
         $startTime = microtime(true);
 
+        $this->sqlLogger->info('收到SQL查询请求', [
+            'client_id' => $context->getClientId(),
+            'sql' => $sql,
+        ]);
+
         // 检查排除规则
         if (WildcardHelper::shouldExclude($sql, $this->excludePatterns)) {
+            $this->sqlLogger->debug('SQL匹配排除规则，直接转发', [
+                'client_id' => $context->getClientId(),
+                'sql' => $sql,
+                'exclude_patterns' => $this->excludePatterns,
+            ]);
             $this->forwardToTarget($server, $context, $packet);
             return;
         }
@@ -175,6 +191,16 @@ class ProxyService
             $group = isset($dsnParams['group']) ? $dsnParams['group'] : null;
             $transactionId = $context->isInTransaction() ? $context->getTransactionId() : null;
 
+            $this->sqlLogger->info('SQL查询完成', [
+                'client_id' => $context->getClientId(),
+                'client_info' => (string) $context,
+                'sql' => $sql,
+                'group' => $group,
+                'transaction_id' => $transactionId,
+                'elapsed_ms' => $elapsedMs,
+                'affected_rows' => $affectedRows,
+            ]);
+
             \App\Helpers\LogHelper::writeLog(
                 (string) $context,
                 $sql,
@@ -189,12 +215,24 @@ class ProxyService
 
     private function handlePrepare(\Swoole\Server $server, ConnectionContext $context, Packet $packet, string $sql): void
     {
+        $this->sqlLogger->info('收到预处理语句请求', [
+            'client_id' => $context->getClientId(),
+            'sql' => $sql,
+        ]);
+
         $response = $this->forwardToTargetAndGetResponse($server, $context, $packet);
 
         // 注册预处理语句
         if ($response && isset($response[0])) {
             $prepareResp = Prepare::parsePrepareResponse($response[0]);
-            Parser::registerPreparedStatement($prepareResp['statement_id'], $sql);
+            $stmtId = $prepareResp['statement_id'];
+            Parser::registerPreparedStatement($stmtId, $sql);
+
+            $this->sqlLogger->debug('预处理语句注册成功', [
+                'client_id' => $context->getClientId(),
+                'statement_id' => $stmtId,
+                'sql' => $sql,
+            ]);
         }
     }
 
@@ -203,10 +241,25 @@ class ProxyService
         $stmtId = $data['statement_id'];
         $sql = Parser::getPreparedStatement($stmtId);
 
+        $this->sqlLogger->info('收到预处理语句执行请求', [
+            'client_id' => $context->getClientId(),
+            'statement_id' => $stmtId,
+            'sql' => $sql,
+        ]);
+
         if ($sql && $this->logEnabled) {
             $dsnParams = $context->getDsnParams();
             $group = isset($dsnParams['group']) ? $dsnParams['group'] : null;
             $transactionId = $context->isInTransaction() ? $context->getTransactionId() : null;
+
+            $this->sqlLogger->info('预处理语句执行', [
+                'client_id' => $context->getClientId(),
+                'client_info' => (string) $context,
+                'sql' => "[EXECUTE] " . $sql,
+                'group' => $group,
+                'transaction_id' => $transactionId,
+                'statement_id' => $stmtId,
+            ]);
 
             \App\Helpers\LogHelper::writeLog(
                 (string) $context,
@@ -225,11 +278,19 @@ class ProxyService
     private function handleQuit(\Swoole\Server $server, ConnectionContext $context): void
     {
         $clientId = $context->getClientId();
+
+        $this->connectionLogger->info('客户端请求断开连接', [
+            'client_id' => $clientId,
+        ]);
+
         unset($this->connections[$clientId]);
 
         // 关闭目标MySQL连接
         if ($context->getMysqlSocket()) {
             $context->getMysqlSocket()->close();
+            $this->connectionLogger->debug('已关闭目标MySQL连接', [
+                'client_id' => $clientId,
+            ]);
         }
     }
 
@@ -252,17 +313,51 @@ class ProxyService
         $host = $context->getTargetHost() !== null ? $context->getTargetHost() : $defaultHost;
         $port = (int) ($context->getTargetPort() !== null ? $context->getTargetPort() : $defaultPort);
 
-        $socket = new Socket(AF_INET, SOCK_STREAM, 0);
-        $socket->connect($host, $port);
+        $this->connectionLogger->info('开始连接目标MySQL服务器', [
+            'client_id' => $context->getClientId(),
+            'host' => $host,
+            'port' => $port,
+        ]);
 
-        $context->setMysqlSocket($socket);
+        try {
+            $socket = new Socket(AF_INET, SOCK_STREAM, 0);
+            $socket->connect($host, $port);
 
-        // 转发认证数据
-        $socket->sendAll($packet->toBytes());
+            $context->setMysqlSocket($socket);
 
-        // 读取响应并转发回客户端
-        $response = $this->readAllPackets($socket);
-        $server->send((int) $context->getClientId(), $response);
+            $this->connectionLogger->info('MySQL连接建立成功', [
+                'client_id' => $context->getClientId(),
+                'host' => $host,
+                'port' => $port,
+            ]);
+
+            // 转发认证数据
+            $socket->sendAll($packet->toBytes());
+
+            $this->connectionLogger->debug('已发送认证数据', [
+                'client_id' => $context->getClientId(),
+                'data_length' => strlen($packet->toBytes()),
+            ]);
+
+            // 读取响应并转发回客户端
+            $response = $this->readAllPackets($socket);
+            $server->send((int) $context->getClientId(), $response);
+
+            $this->connectionLogger->debug('认证响应已转发', [
+                'client_id' => $context->getClientId(),
+                'response_length' => strlen($response),
+            ]);
+        } catch (\Exception $e) {
+            $this->connectionLogger->error('MySQL连接失败', [
+                'client_id' => $context->getClientId(),
+                'host' => $host,
+                'port' => $port,
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+            throw $e;
+        }
     }
 
     private function forwardToTarget(\Swoole\Server $server, ConnectionContext $context, Packet $packet): void
@@ -274,12 +369,24 @@ class ProxyService
             return;
         }
 
-        $socket->sendAll($packet->toBytes());
+        $packetData = $packet->toBytes();
+        $this->connectionLogger->debug('转发数据包到目标MySQL', [
+            'client_id' => $context->getClientId(),
+            'data_length' => strlen($packetData),
+            'command' => $packet->getCommand(),
+        ]);
+
+        $socket->sendAll($packetData);
 
         // 读取响应并转发回客户端
         $response = $this->readAllPackets($socket);
         if ($response !== '') {
             $server->send((int) $context->getClientId(), $response);
+
+            $this->connectionLogger->debug('已转发MySQL响应', [
+                'client_id' => $context->getClientId(),
+                'response_length' => strlen($response),
+            ]);
         }
     }
 
@@ -292,13 +399,26 @@ class ProxyService
             return [];
         }
 
-        $socket->sendAll($packet->toBytes());
+        $packetData = $packet->toBytes();
+        $this->connectionLogger->debug('转发SQL查询到目标MySQL', [
+            'client_id' => $context->getClientId(),
+            'data_length' => strlen($packetData),
+            'command' => $packet->getCommand(),
+        ]);
+
+        $socket->sendAll($packetData);
 
         $responseData = $this->readAllPackets($socket);
         $packets = Parser::parsePackets($responseData);
 
         if ($responseData !== '') {
             $server->send((int) $context->getClientId(), $responseData);
+
+            $this->connectionLogger->debug('已转发MySQL响应', [
+                'client_id' => $context->getClientId(),
+                'response_length' => strlen($responseData),
+                'packet_count' => count($packets),
+            ]);
         }
 
         return $packets;
@@ -352,9 +472,18 @@ class ProxyService
         if (isset($this->connections[$clientId])) {
             $context = $this->connections[$clientId];
 
+            $this->connectionLogger->info('客户端连接关闭', [
+                'client_id' => $clientId,
+                'client_ip' => $context->getRemoteIp(),
+                'client_port' => $context->getRemotePort(),
+            ]);
+
             // 关闭目标MySQL连接
             if ($context->getMysqlSocket()) {
                 $context->getMysqlSocket()->close();
+                $this->connectionLogger->debug('已关闭目标MySQL连接', [
+                    'client_id' => $clientId,
+                ]);
             }
 
             unset($this->connections[$clientId]);

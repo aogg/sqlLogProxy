@@ -44,4 +44,38 @@ return [
             ],
         ],
     ],
+    'sql' => [
+        'handler' => [
+            'class' => Monolog\Handler\RotatingFileHandler::class,
+            'constructor' => [
+                'filename' => BASE_PATH . '/runtime/logs/sql.log',
+                'level' => Monolog\Logger::INFO,
+            ],
+        ],
+        'formatter' => [
+            'class' => Monolog\Formatter\LineFormatter::class,
+            'constructor' => [
+                'format' => "[%datetime%] %channel%.%level_name%: %message%\n",
+                'dateFormat' => 'Y-m-d H:i:s.v',
+                'allowInlineLineBreaks' => true,
+            ],
+        ],
+    ],
+    'connection' => [
+        'handler' => [
+            'class' => Monolog\Handler\RotatingFileHandler::class,
+            'constructor' => [
+                'filename' => BASE_PATH . '/runtime/logs/connection.log',
+                'level' => Monolog\Logger::DEBUG,
+            ],
+        ],
+        'formatter' => [
+            'class' => Monolog\Formatter\LineFormatter::class,
+            'constructor' => [
+                'format' => "[%datetime%] %channel%.%level_name%: %message%\n",
+                'dateFormat' => 'Y-m-d H:i:s.v',
+                'allowInlineLineBreaks' => true,
+            ],
+        ],
+    ],
 ];

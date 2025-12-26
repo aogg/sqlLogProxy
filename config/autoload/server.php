@@ -12,6 +12,7 @@ declare(strict_types=1);
 use Hyperf\Server\Event;
 use Hyperf\Server\Server;
 use Swoole\Constant;
+use function Hyperf\Support\env;
 
 return [
     'mode' => SWOOLE_PROCESS,
@@ -28,6 +29,26 @@ return [
             'options' => [
                 // Whether to enable request lifecycle event
                 'enable_request_lifecycle' => false,
+            ],
+        ],
+        [
+            'name' => 'mysql-proxy',
+            'type' => Server::SERVER_BASE,
+            'host' => '0.0.0.0',
+            'port' => (int)env('PROXY_PORT', 3307),
+            'sock_type' => SWOOLE_SOCK_TCP,
+            'callbacks' => [
+                Event::ON_RECEIVE => [\App\Service\ProxyService::class, 'onReceive'],
+                Event::ON_CLOSE => [\App\Service\ProxyService::class, 'onClose'],
+                Event::ON_CONNECT => [\App\Service\ProxyService::class, 'onConnect'],
+            ],
+            'options' => [
+                'open_eof_split' => false,
+                'open_length_check' => true,
+                'package_length_type' => 'N',
+                'package_length_offset' => 0,
+                'package_body_offset' => 4,
+                'package_max_length' => 64 * 1024 * 1024,
             ],
         ],
     ],

@@ -12,14 +12,27 @@ class Parser
     {
         $packets = [];
         $offset = 0;
+        $totalLength = strlen($data);
 
-        while ($offset < strlen($data)) {
-            if ($offset + 4 > strlen($data)) {
+        while ($offset < $totalLength) {
+            // 检查是否有足够的字节来读取包头
+            if ($offset + 4 > $totalLength) {
                 break;
             }
 
             $length = unpack('V', substr($data, $offset, 3) . "\x00")[1];
             $sequenceId = ord($data[$offset + 3]);
+
+            // 验证包长度是否合理
+            if ($length < 0 || $length > 0xffffff) {
+                throw new \RuntimeException("无效的包长度: {$length}");
+            }
+
+            // 检查是否有足够的字节来读取payload
+            if ($offset + 4 + $length > $totalLength) {
+                break;
+            }
+
             $payload = substr($data, $offset + 4, $length);
 
             $packets[] = new Packet($length, $sequenceId, $payload);

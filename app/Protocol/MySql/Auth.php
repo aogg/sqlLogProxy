@@ -38,20 +38,33 @@ class Auth
     {
         $payload = $packet->getPayload();
         $offset = 0;
+        $payloadLength = strlen($payload);
 
         // Capability Flags (4 bytes)
+        if ($offset + 4 > $payloadLength) {
+            throw new \RuntimeException('解析握手响应失败：数据包长度不足，无法读取 Capability Flags');
+        }
         $capabilities = unpack('V', substr($payload, $offset, 4))[1];
         $offset += 4;
 
         // Max Packet Size (4 bytes)
+        if ($offset + 4 > $payloadLength) {
+            throw new \RuntimeException('解析握手响应失败：数据包长度不足，无法读取 Max Packet Size');
+        }
         $maxPacketSize = unpack('V', substr($payload, $offset, 4))[1];
         $offset += 4;
 
         // Character Set (1 byte)
+        if ($offset + 1 > $payloadLength) {
+            throw new \RuntimeException('解析握手响应失败：数据包长度不足，无法读取 Character Set');
+        }
         $charset = ord($payload[$offset]);
         $offset += 1;
 
         // Reserved (23 bytes)
+        if ($offset + 23 > $payloadLength) {
+            throw new \RuntimeException('解析握手响应失败：数据包长度不足，无法读取 Reserved');
+        }
         $offset += 23;
 
         // Username (NUL terminated string)
@@ -63,14 +76,21 @@ class Auth
         $offset++; // skip NUL
 
         // Auth Response (length encoded integer)
+        if ($offset + 1 > $payloadLength) {
+            throw new \RuntimeException('解析握手响应失败：数据包长度不足，无法读取 Auth Response 长度');
+        }
         $authResponseLength = ord($payload[$offset]);
         $offset += 1;
+
+        if ($offset + $authResponseLength > $payloadLength) {
+            throw new \RuntimeException('解析握手响应失败：数据包长度不足，无法读取完整的 Auth Response');
+        }
         $authResponse = substr($payload, $offset, $authResponseLength);
         $offset += $authResponseLength;
 
         // Database (NUL terminated string) - only if CLIENT_CONNECT_WITH_DB
         $database = '';
-        if ($capabilities & 0x00000008 && $offset < strlen($payload)) {
+        if ($capabilities & 0x00000008 && $offset < $payloadLength) {
             while (isset($payload[$offset]) && $payload[$offset] !== "\x00") {
                 $database .= $payload[$offset];
                 $offset++;
@@ -80,7 +100,7 @@ class Auth
 
         // Auth Plugin Name (NUL terminated string) - only if CLIENT_PLUGIN_AUTH
         $authPluginName = '';
-        if ($capabilities & 0x00080000 && $offset < strlen($payload)) {
+        if ($capabilities & 0x00080000 && $offset < $payloadLength) {
             while (isset($payload[$offset]) && $payload[$offset] !== "\x00") {
                 $authPluginName .= $payload[$offset];
                 $offset++;

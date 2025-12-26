@@ -42,6 +42,21 @@ class ApplicationLifecycleListener implements ListenerInterface
                 'event' => 'BeforeWorkerStart',
                 'workerNum' => $event->serverSetting['worker_num'] ?? 'unknown',
             ]);
+
+            // 测试connection logger
+            try {
+                $connectionLogger = $this->container->get(\Hyperf\Logger\LoggerFactory::class)->get('connection');
+                $connectionLogger->info('BeforeWorkerStart阶段connection logger测试', [
+                    'workerNum' => $event->serverSetting['worker_num'] ?? 'unknown',
+                    'pid' => getmypid(),
+                ]);
+            } catch (\Throwable $e) {
+                $this->logger->error('获取connection logger失败', [
+                    'error' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ]);
+            }
         }
     }
 }

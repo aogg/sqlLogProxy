@@ -38,9 +38,9 @@ return [
             'port' => (int)env('PROXY_PORT', 3307),
             'sock_type' => SWOOLE_SOCK_TCP,
             'callbacks' => [
+                Event::ON_CONNECT => [\App\Service\ProxyService::class, 'onConnect'],
                 Event::ON_RECEIVE => [\App\Service\ProxyService::class, 'onReceive'],
                 Event::ON_CLOSE => [\App\Service\ProxyService::class, 'onClose'],
-                Event::ON_CONNECT => [\App\Service\ProxyService::class, 'onConnect'],
             ],
             'options' => [
                 'open_eof_split' => false,
@@ -58,7 +58,6 @@ return [
         Constant::OPTION_PID_FILE => BASE_PATH . '/runtime/hyperf.pid',
         Constant::OPTION_OPEN_TCP_NODELAY => true,
         Constant::OPTION_MAX_COROUTINE => 100000,
-        Constant::OPTION_OPEN_HTTP2_PROTOCOL => true,
         Constant::OPTION_MAX_REQUEST => 100000,
         Constant::OPTION_SOCKET_BUFFER_SIZE => 2 * 1024 * 1024,
         Constant::OPTION_BUFFER_OUTPUT_SIZE => 2 * 1024 * 1024,

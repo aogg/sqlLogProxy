@@ -453,7 +453,6 @@ class ProxyService
                 'client_id' => $context->getClientId(),
                 'host' => $host,
                 'port' => $port,
-                'socket_resource' => get_resource_type($socket->getSocket()) ?? 'unknown',
             ]);
 
             // 转发认证数据
@@ -727,8 +726,8 @@ class ProxyService
 
             $this->connectionLogger->info('客户端连接关闭详情', [
                 'client_id' => $clientId,
-                'client_ip' => $context->getRemoteIp(),
-                'client_port' => $context->getRemotePort(),
+                'client_ip' => $context->getClientIp(),
+                'client_port' => $context->getClientPort(),
                 'in_transaction' => $context->isInTransaction(),
                 'mysql_socket_exists' => $context->getMysqlSocket() !== null,
             ]);

@@ -94,35 +94,51 @@ class ProxyService
 
         $this->connections[$clientId] = $context;
 
-        // 发送握手包
-        $authData = Auth::generateAuthData(20);
+        // 连接到目标MySQL并获取握手包
+        $defaultHost = config('proxy.target.host', '127.0.0.1');
+        $defaultPort = config('proxy.target.port', 3307);
 
-        $this->connectionLogger->debug('生成握手数据', [
-            'client_id' => $clientId,
-            'auth_data_length' => strlen($authData),
-        ]);
+        $host = $context->getTargetHost() !== null ? $context->getTargetHost() : $defaultHost;
+        $port = (int) ($context->getTargetPort() !== null ? $context->getTargetPort() : $defaultPort);
 
-        $handshake = Handshake::createHandshakeV10(
-            (int) $clientId,
-            $authData,
-            'mysql_native_password'
-        );
+        try {
+            $this->connectionLogger->debug('创建MySQL连接以获取握手包', [
+                'client_id' => $clientId,
+                'host' => $host,
+                'port' => $port,
+            ]);
 
-        $handshakeBytes = $handshake->toBytes();
+            $socket = new Socket(AF_INET, SOCK_STREAM, 0);
+            $socket->connect($host, $port);
 
-        $this->connectionLogger->debug('发送握手包', [
-            'client_id' => $clientId,
-            'handshake_length' => strlen($handshakeBytes),
-        ]);
+            // 读取MySQL握手包
+            $mysqlHandshakeData = $this->readAllPackets($socket);
 
-        $sendResult = $server->send($fd, $handshakeBytes);
+            $this->connectionLogger->debug('收到MySQL握手包', [
+                'client_id' => $clientId,
+                'handshake_length' => strlen($mysqlHandshakeData),
+                'handshake_hex' => bin2hex(substr($mysqlHandshakeData, 0, 64)),
+            ]);
 
-        $this->connectionLogger->info('握手包发送结果', [
-            'client_id' => $clientId,
-            'client_info' => (string) $context,
-            'send_result' => $sendResult,
-            'handshake_length' => strlen($handshakeBytes),
-        ]);
+            // 保存MySQL socket到上下文
+            $context->setMysqlSocket($socket);
+
+            // 直接转发MySQL的握手包
+            $sendResult = $server->send($fd, $mysqlHandshakeData);
+
+            $this->connectionLogger->info('MySQL握手包已转发', [
+                'client_id' => $clientId,
+                'handshake_length' => strlen($mysqlHandshakeData),
+                'send_result' => $sendResult,
+            ]);
+        } catch (\Exception $e) {
+            $this->connectionLogger->error('获取MySQL握手包失败', [
+                'client_id' => $clientId,
+                'error' => $e->getMessage(),
+                'error_code' => $e->getCode(),
+            ]);
+            throw $e;
+        }
     }
 
     public function onReceive(\Swoole\Server $server, int $fd, int $reactorId, string $data): void
@@ -145,7 +161,7 @@ class ProxyService
         $context = isset($this->connections[$clientId]) ? $this->connections[$clientId] : null;
 
         if (!$context) {
-            $this->connectionLogger->warning('收到未知客户端的数据', [
+            $this->connectionLogger->warning('sql代理: 收到未知客户端的数据', [
                 'client_id' => $clientId,
                 'data_length' => strlen($data),
                 'data_hex' => bin2hex(substr($data, 0, 64)),
@@ -153,10 +169,11 @@ class ProxyService
             return;
         }
 
-        $this->connectionLogger->debug('收到客户端数据', [
+        $this->connectionLogger->info('收到客户端数据', [
             'client_id' => $clientId,
             'data_length' => strlen($data),
-            'data_hex' => bin2hex(substr($data, 0, 64)),
+            'data_hex' => bin2hex($data),
+            'data_ascii' => $this->toAscii($data),
         ]);
 
         try {
@@ -178,7 +195,7 @@ class ProxyService
             }
         } catch (\Exception $e) {
             // 记录错误日志到 Hyperf 日志组件
-            $this->logger->error('处理数据包错误', [
+            $this->logger->error('sql代理: 处理数据包错误', [
                 'message' => $e->getMessage(),
                 'error_code' => $e->getCode(),
                 'file' => $e->getFile(),
@@ -217,19 +234,36 @@ class ProxyService
         if ($packet->getSequenceId() === 1 && $context->getMysqlSocket() === null) {
             $this->connectionLogger->info('检测到客户端认证响应，准备连接目标MySQL', [
                 'client_id' => $context->getClientId(),
+                'sequence_id' => $sequenceId,
+                'packet_command' => $command,
+                'payload_length' => strlen($payload),
             ]);
 
             // 客户端发送认证信息
-            $authResponse = Auth::parseHandshakeResponse($packet);
+            try {
+                $authResponse = Auth::parseHandshakeResponse($packet);
 
-            $this->connectionLogger->info('解析客户端认证信息', [
-                'client_id' => $context->getClientId(),
-                'username' => $authResponse['username'] ?? 'unknown',
-                'database' => $authResponse['database'] ?? 'unknown',
-                'auth_plugin' => $authResponse['auth_plugin_name'] ?? 'unknown',
-                'charset' => $authResponse['charset'] ?? 'unknown',
-                'capabilities' => $authResponse['capabilities'] ?? 0,
-            ]);
+                $this->connectionLogger->info('解析客户端认证信息成功', [
+                    'client_id' => $context->getClientId(),
+                    'username' => $authResponse['username'] ?? 'unknown',
+                    'database' => $authResponse['database'] ?? 'unknown',
+                    'auth_plugin' => $authResponse['auth_plugin_name'] ?? 'unknown',
+                    'charset' => $authResponse['charset'] ?? 'unknown',
+                    'capabilities_hex' => sprintf('0x%08x', $authResponse['capabilities'] ?? 0),
+                    'capabilities_dec' => $authResponse['capabilities'] ?? 0,
+                    'max_packet_size' => $authResponse['max_packet_size'] ?? 0,
+                    'auth_response_length' => strlen($authResponse['auth_response'] ?? ''),
+                    'payload_hex' => bin2hex($payload),
+                ]);
+            } catch (\Exception $e) {
+                $this->connectionLogger->error('sql代理: 解析客户端认证信息失败', [
+                    'client_id' => $context->getClientId(),
+                    'error' => $e->getMessage(),
+                    'payload_hex' => bin2hex($payload),
+                    'payload_length' => strlen($payload),
+                ]);
+                throw $e;
+            }
 
             // 从数据库参数中获取目标MySQL配置
             $targetPort = $context->getTargetPort() !== null ? $context->getTargetPort() : 3306;
@@ -417,44 +451,16 @@ class ProxyService
 
     private function connectToTargetAndForward(\Swoole\Server $server, ConnectionContext $context, Packet $packet): void
     {
-        $defaultHost = config('proxy.target.host', '127.0.0.1');
-        $defaultPort = config('proxy.target.port', 3307);
+        $socket = $context->getMysqlSocket();
 
-        $host = $context->getTargetHost() !== null ? $context->getTargetHost() : $defaultHost;
-        $port = (int) ($context->getTargetPort() !== null ? $context->getTargetPort() : $defaultPort);
-
-        $this->connectionLogger->info('开始连接目标MySQL服务器', [
-            'client_id' => $context->getClientId(),
-            'host' => $host,
-            'port' => $port,
-            'default_host' => $defaultHost,
-            'default_port' => $defaultPort,
-        ]);
+        if (!$socket) {
+            $this->connectionLogger->error('MySQL连接不存在', [
+                'client_id' => $context->getClientId(),
+            ]);
+            throw new \RuntimeException('MySQL连接不存在');
+        }
 
         try {
-            $this->connectionLogger->debug('创建Socket对象', [
-                'client_id' => $context->getClientId(),
-                'address_family' => AF_INET,
-                'socket_type' => SOCK_STREAM,
-            ]);
-
-            $socket = new Socket(AF_INET, SOCK_STREAM, 0);
-
-            $this->connectionLogger->debug('Socket对象创建成功，开始连接', [
-                'client_id' => $context->getClientId(),
-                'target' => $host . ':' . $port,
-            ]);
-
-            $socket->connect($host, $port);
-
-            $context->setMysqlSocket($socket);
-
-            $this->connectionLogger->info('MySQL连接建立成功', [
-                'client_id' => $context->getClientId(),
-                'host' => $host,
-                'port' => $port,
-            ]);
-
             // 转发认证数据
             $authData = $packet->toBytes();
             $this->connectionLogger->debug('准备发送认证数据', [
@@ -483,6 +489,19 @@ class ProxyService
                 'response_length' => strlen($response),
             ]);
 
+            // 解析MySQL响应，检查是否是错误包
+            $responsePackets = Parser::parsePackets($response);
+            if (!empty($responsePackets) && Response::isErrorPacket($responsePackets[0])) {
+                $errorData = Response::parseErrorPacket($responsePackets[0]);
+                $this->connectionLogger->error('MySQL认证失败', [
+                    'client_id' => $context->getClientId(),
+                    'error_code' => $errorData['error_code'],
+                    'sql_state' => $errorData['sql_state'],
+                    'error_message' => $errorData['error_message'],
+                ]);
+            }
+
+            // 直接转发MySQL响应（保持原始sequence_id）
             $server->send((int) $context->getClientId(), $response);
 
             $this->connectionLogger->info('认证响应已转发', [
@@ -490,10 +509,8 @@ class ProxyService
                 'response_length' => strlen($response),
             ]);
         } catch (\Swoole\Coroutine\Socket\Exception $e) {
-            $this->connectionLogger->error('MySQL Socket连接失败', [
+            $this->connectionLogger->error('sql代理: MySQL Socket操作失败', [
                 'client_id' => $context->getClientId(),
-                'host' => $host,
-                'port' => $port,
                 'error_code' => $e->getCode(),
                 'error_message' => $e->getMessage(),
                 'error_string' => socket_strerror($e->getCode()),
@@ -502,10 +519,8 @@ class ProxyService
             ]);
             throw $e;
         } catch (\Exception $e) {
-            $this->connectionLogger->error('MySQL连接失败', [
+            $this->connectionLogger->error('sql代理: 认证失败', [
                 'client_id' => $context->getClientId(),
-                'host' => $host,
-                'port' => $port,
                 'error' => $e->getMessage(),
                 'error_code' => $e->getCode(),
                 'file' => $e->getFile(),
@@ -546,6 +561,7 @@ class ProxyService
         // 读取响应并转发回客户端
         $response = $this->readAllPackets($socket);
         if ($response !== '') {
+            // 直接转发MySQL响应（保持原始sequence_id）
             $server->send((int) $context->getClientId(), $response);
 
             $this->connectionLogger->debug('已转发MySQL响应', [
@@ -553,7 +569,7 @@ class ProxyService
                 'response_length' => strlen($response),
             ]);
         } else {
-            $this->connectionLogger->warning('MySQL响应为空', [
+            $this->connectionLogger->warning('sql代理: MySQL响应为空', [
                 'client_id' => $context->getClientId(),
             ]);
         }
@@ -600,7 +616,19 @@ class ProxyService
             'packet_count' => count($packets),
         ]);
 
+        // 检查MySQL返回的响应是否是错误包
+        if (!empty($packets) && Response::isErrorPacket($packets[0])) {
+            $errorData = Response::parseErrorPacket($packets[0]);
+            $this->connectionLogger->error('MySQL查询错误', [
+                'client_id' => $context->getClientId(),
+                'error_code' => $errorData['error_code'],
+                'sql_state' => $errorData['sql_state'],
+                'error_message' => $errorData['error_message'],
+            ]);
+        }
+
         if ($responseData !== '') {
+            // 直接转发MySQL响应（保持原始sequence_id）
             $server->send((int) $context->getClientId(), $responseData);
 
             $this->connectionLogger->debug('已转发MySQL响应', [
@@ -609,7 +637,7 @@ class ProxyService
                 'packet_count' => count($packets),
             ]);
         } else {
-            $this->connectionLogger->warning('MySQL响应为空', [
+            $this->connectionLogger->warning('sql代理: MySQL响应为空', [
                 'client_id' => $context->getClientId(),
             ]);
         }
@@ -620,7 +648,7 @@ class ProxyService
     private function readAllPackets(Socket $socket): string
     {
         $buffer = '';
-        $timeout = 1.0;
+        $timeout = 2.0; // 超时时间
 
         $this->connectionLogger->debug('开始读取第一个数据包头', [
             'timeout' => $timeout,
@@ -628,10 +656,10 @@ class ProxyService
 
         // 读取第一个包
         $header = $socket->recvAll(4, $timeout);
-        if (strlen($header) !== 4) {
-            $this->connectionLogger->warning('读取包头失败或超时', [
+        if ($header === false || strlen($header) !== 4) {
+            $this->connectionLogger->error('sql代理: 读取包头失败或超时', [
                 'expected_length' => 4,
-                'actual_length' => strlen($header),
+                'actual_length' => $header === false ? 'false' : strlen($header),
                 'timeout' => $timeout,
             ]);
             return $buffer;
@@ -647,27 +675,55 @@ class ProxyService
         ]);
 
         $payload = $socket->recvAll($length, $timeout);
-        if (strlen($payload) !== $length) {
-            $this->connectionLogger->warning('读取Payload失败或超时', [
+        if ($payload === false || strlen($payload) !== $length) {
+            $this->connectionLogger->error('sql代理: 读取Payload失败或超时', [
                 'expected_length' => $length,
-                'actual_length' => strlen($payload),
+                'actual_length' => $payload === false ? 'false' : strlen($payload),
                 'timeout' => $timeout,
             ]);
         }
 
         $buffer .= $header . $payload;
-
-        // 检查是否还有更多包（ResultSet）
         $numPackets = 1;
+
+        // 检查第一个包的类型
+        $firstPacket = Packet::fromString($header . $payload);
+        $firstByte = ord($payload[0] ?? 0);
+        $isHandshakePacket = ($firstByte === 10); // 握手包的protocol_version是10
+        $isOkPacket = Response::isOkPacket($firstPacket); // OK包的第一个字节是0x00
+        $isErrorPacket = Response::isErrorPacket($firstPacket); // ERR包的第一个字节是0xff
+
+        $this->connectionLogger->debug('分析第一个包类型', [
+            'first_byte' => $firstByte,
+            'is_handshake_packet' => $isHandshakePacket,
+            'is_ok_packet' => $isOkPacket,
+            'is_error_packet' => $isErrorPacket,
+        ]);
+
+        // 如果是握手包、OK包或ERR包，只返回这一个包
+        if ($isHandshakePacket || $isOkPacket || $isErrorPacket) {
+            $packetType = $isHandshakePacket ? '握手包' : ($isOkPacket ? 'OK包' : 'ERR包');
+            $this->connectionLogger->debug('检测到' . $packetType . '，停止读取', [
+                'total_packets' => $numPackets,
+                'total_bytes' => strlen($buffer),
+            ]);
+            return $buffer;
+        }
+
+        // 否则，继续读取后续数据包（ResultSet等）
         $this->connectionLogger->debug('开始读取后续数据包', [
             'current_packet_count' => $numPackets,
         ]);
 
-        while (true) {
+        $maxRetries = 3; // 最多重试3次
+        $retryCount = 0;
+
+        while ($retryCount < $maxRetries) {
             $nextHeader = $socket->recv(4, $timeout);
             if (strlen($nextHeader) !== 4) {
                 $this->connectionLogger->debug('后续包头读取完成，无更多数据', [
                     'header_length' => strlen($nextHeader),
+                    'retry_count' => $retryCount,
                 ]);
                 break;
             }
@@ -675,12 +731,15 @@ class ProxyService
             $nextLength = unpack('V', substr($nextHeader, 0, 3) . "\x00")[1];
             $nextPayload = $socket->recvAll($nextLength, $timeout);
 
-            if (strlen($nextPayload) !== $nextLength) {
-                $this->connectionLogger->warning('读取后续Payload失败或超时', [
+            if ($nextPayload === false || strlen($nextPayload) !== $nextLength) {
+                $this->connectionLogger->error('sql代理: 读取后续Payload失败或超时', [
                     'expected_length' => $nextLength,
-                    'actual_length' => strlen($nextPayload),
+                    'actual_length' => $nextPayload === false ? 'false' : strlen($nextPayload),
                     'timeout' => $timeout,
+                    'retry_count' => $retryCount,
                 ]);
+                $retryCount++;
+                continue;
             }
 
             $buffer .= $nextHeader . $nextPayload;
@@ -695,8 +754,10 @@ class ProxyService
             }
 
             $numPackets++;
+            $retryCount = 0; // 成功读取包，重置重试计数
+
             if ($numPackets > 10000) { // 防止无限循环
-                $this->connectionLogger->warning('数据包数量超过限制，停止读取', [
+                $this->connectionLogger->warning('sql代理: 数据包数量超过限制，停止读取', [
                     'max_packets' => 10000,
                     'current_count' => $numPackets,
                 ]);
@@ -730,6 +791,8 @@ class ProxyService
                 'client_port' => $context->getClientPort(),
                 'in_transaction' => $context->isInTransaction(),
                 'mysql_socket_exists' => $context->getMysqlSocket() !== null,
+                'target_host' => $context->getTargetHost(),
+                'target_port' => $context->getTargetPort(),
             ]);
 
             // 关闭目标MySQL连接
@@ -751,9 +814,33 @@ class ProxyService
                 'client_id' => $clientId,
             ]);
         } else {
-            $this->connectionLogger->warning('未找到连接上下文', [
+            $this->connectionLogger->warning('sql代理: 未找到连接上下文', [
                 'client_id' => $clientId,
             ]);
         }
+    }
+
+    /**
+     * 将二进制数据转换为可读的ASCII字符串（用于日志）
+     */
+    private function toAscii(string $data): string
+    {
+        $result = '';
+        $length = min(strlen($data), 256); // 限制长度
+
+        for ($i = 0; $i < $length; $i++) {
+            $char = $data[$i];
+            $ord = ord($char);
+
+            if ($ord >= 32 && $ord <= 126) {
+                // 可打印字符
+                $result .= $char;
+            } else {
+                // 控制字符，用点号代替
+                $result .= '.';
+            }
+        }
+
+        return $result;
     }
 }

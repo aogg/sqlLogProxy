@@ -8,7 +8,8 @@ use App\Exception\ProxyException;
 
 class Auth
 {
-    public const CAPABILITIES = 0x000880df;
+    // 与 Handshake 类保持一致的 capabilities
+    public const CAPABILITIES = 0x00aff7df;
     private const MAX_PACKET_SIZE = 0xffffff;
 
     public static function generateAuthData(int $length = 20): string

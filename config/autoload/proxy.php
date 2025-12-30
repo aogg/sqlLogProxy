@@ -33,6 +33,36 @@ return [
         'require_client_cert' => false, // 是否要求客户端证书
     ],
 
+    // 代理账号配置（客户端连接代理时使用的账号）
+    'proxy_accounts' => [
+        [
+            'username' => 'proxy_user',
+            'password' => 'proxy_pass', // 生产环境建议使用哈希存储
+            'database' => '', // 允许连接的数据库，可为空表示不限制
+        ],
+        // 可以添加更多代理账号
+        // [
+        //     'username' => 'admin',
+        //     'password' => 'admin123',
+        //     'database' => 'test',
+        // ],
+    ],
+
+    // 后端真实MySQL账号配置（代理使用此账号连接真实MySQL）
+    'backend_mysql' => [
+        'host' => env('TARGET_MYSQL_HOST', 'mysql57.common-all'),
+        'port' => (int) env('TARGET_MYSQL_PORT', 3306),
+        'username' => env('TARGET_MYSQL_USERNAME', 'root'),
+        'password' => env('TARGET_MYSQL_PASSWORD', 'root'),
+        'database' => env('TARGET_MYSQL_DATABASE', ''),
+        'charset' => 'utf8mb4',
+        'connect_timeout' => 5.0,
+        'tls' => false, // 代理到真实MySQL的连接是否使用TLS
+        'tls_ca_file' => null,
+        'tls_cert_file' => null,
+        'tls_key_file' => null,
+    ],
+
     // 日志配置
     'log' => [
         'enabled' => true,

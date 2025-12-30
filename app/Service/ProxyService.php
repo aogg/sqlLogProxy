@@ -15,9 +15,12 @@ use Swoole\Coroutine;
 use Swoole\Coroutine\Socket;
 use App\Protocol\ConnectionContext;
 use App\Protocol\MySql\{Auth, Command, Handshake, Packet, Parser, Prepare, Query, Response};
-use App\Service\Pool\ConnectionPool;
 use App\Service\TargetConnector;
 use App\Service\ProxyTlsHandler;
+use App\Proxy\Service\MySQLProxyService;
+use App\Proxy\Protocol\MySQLHandshake as NewMySQLHandshake;
+use App\Proxy\Auth\ProxyAuthenticator;
+use App\Proxy\Executor\BackendExecutor;
 use function Hyperf\Config\config;
 
 class ProxyService
@@ -32,7 +35,6 @@ class ProxyService
     private LoggerInterface $sqlLogger;
     private LoggerInterface $connectionLogger;
     private LoggerInterface $mysqlSendLogger;
-    private ?ConnectionPool $connectionPool = null;
     private ?ProxyTlsHandler $tlsHandler = null;
 
     public function __construct(ContainerInterface $container, LoggerFactory $loggerFactory)
@@ -64,17 +66,12 @@ class ProxyService
     }
 
     /**
-     * Initialize the connection pool for this worker
+     * Initialize the proxy service
      */
-    public function initializeConnectionPool(): void
+    public function initialize(): void
     {
-        if ($this->connectionPool !== null) {
-            return; // Already initialized
-        }
-
         try {
             $config = config('proxy', []);
-            $targetConfig = $config['target'] ?? [];
             $tlsConfig = $config['tls'] ?? [];
 
             // Initialize TLS handler
@@ -96,31 +93,8 @@ class ProxyService
                 $this->logger->warning('TLS certificates not configured, TLS termination will not be available');
             }
 
-            $connector = new TargetConnector(
-                $targetConfig['host'] ?? 'mysql57.common-all',
-                $targetConfig['port'] ?? 3306,
-                $targetConfig['connect_timeout'] ?? 5.0,
-                $targetConfig['tls'] ?? true,
-                $targetConfig['tls_ca_file'] ?? null,
-                $targetConfig['tls_cert_file'] ?? null,
-                $targetConfig['tls_key_file'] ?? null
-            );
-
-            $poolSize = $config['pool']['size'] ?? 12;
-            $idleTimeout = $config['pool']['idle_timeout'] ?? 300.0;
-
-            $this->connectionPool = new ConnectionPool($connector, $poolSize, $idleTimeout);
-
-            $this->logger->info('Connection pool initialized', [
-                'pool_size' => $poolSize,
-                'idle_timeout' => $idleTimeout,
-                'target_host' => $targetConfig['host'] ?? 'mysql57.common-all',
-                'target_port' => $targetConfig['port'] ?? 3306,
-                'target_tls' => $targetConfig['tls'] ?? true,
-            ]);
-
         } catch (\Exception $e) {
-            $this->logger->error('Failed to initialize connection pool', [
+            $this->logger->error('Failed to initialize proxy service', [
                 'error' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
@@ -129,44 +103,6 @@ class ProxyService
         }
     }
 
-    /**
-     * Get a connection from the pool
-     */
-    public function getConnectionFromPool(): ?Socket
-    {
-        if ($this->connectionPool === null) {
-            $this->logger->error('Connection pool not initialized');
-            return null;
-        }
-
-        return $this->connectionPool->borrow();
-    }
-
-    /**
-     * Return a connection to the pool
-     */
-    public function returnConnectionToPool(Socket $socket): void
-    {
-        if ($this->connectionPool === null) {
-            $this->logger->warning('Connection pool not initialized, closing socket');
-            $socket->close();
-            return;
-        }
-
-        $this->connectionPool->release($socket);
-    }
-
-    /**
-     * Get connection pool statistics
-     */
-    public function getPoolStats(): array
-    {
-        if ($this->connectionPool === null) {
-            return ['error' => 'Connection pool not initialized'];
-        }
-
-        return $this->connectionPool->getStats();
-    }
 
     public function onConnect(\Swoole\Server $server, int $fd, int $reactorId): void
     {
@@ -183,7 +119,7 @@ class ProxyService
         ]);
 
         $clientInfo = $server->getClientInfo($fd);
-        $clientId = (string) $fd;
+        $clientId = $fd;
 
         $remoteIp = isset($clientInfo['remote_ip']) ? $clientInfo['remote_ip'] : 'unknown';
         $remotePort = isset($clientInfo['remote_port']) ? $clientInfo['remote_port'] : 0;
@@ -292,25 +228,50 @@ class ProxyService
 
         // 检测是否是TLS握手数据
         if ($this->isTlsHandshake($data)) {
-            $this->connectionLogger->info('检测到TLS握手数据，开始TLS终止处理', [
+            $this->connectionLogger->info('检测到TLS握手数据，尝试启用SSL支持', [
                 'client_id' => $clientId,
                 'data_length' => strlen($data),
             ]);
 
-            // 执行TLS握手终止
-            if ($this->handleTlsHandshake($server, $context, $data)) {
-                // TLS握手成功，标记连接为TLS启用
-                $context->setTlsEnabled(true);
-                $this->connectionLogger->info('TLS握手成功，连接已启用TLS', [
+            // 尝试在现有连接上启用SSL
+            try {
+                $socket = $server->getClientInfo((int) $clientId);
+                if ($socket && isset($socket['socket_fd'])) {
+                    // 获取原始socket并启用SSL
+                    $swooleSocket = new Swoole\Coroutine\Socket($socket['socket_fd']);
+                    $sslResult = $swooleSocket->enableSSL([
+                        'ssl_cert_file' => BASE_PATH . '/runtime/certs/server.crt',
+                        'ssl_key_file' => BASE_PATH . '/runtime/certs/server.key',
+                        'ssl_verify_peer' => false,
+                        'ssl_allow_self_signed' => true,
+                    ]);
+
+                    if ($sslResult) {
+                        $this->connectionLogger->info('SSL启用成功，继续处理连接', ['client_id' => $clientId]);
+                        // SSL启用成功，继续正常处理
+                        return;
+                    } else {
+                        $this->connectionLogger->warning('SSL启用失败', ['client_id' => $clientId]);
+                    }
+                }
+            } catch (\Exception $e) {
+                $this->connectionLogger->error('SSL启用异常', [
                     'client_id' => $clientId,
+                    'error' => $e->getMessage()
                 ]);
-            } else {
-                // TLS握手失败，关闭连接
-                $this->connectionLogger->error('TLS握手失败，关闭连接', [
-                    'client_id' => $clientId,
-                ]);
-                $server->close((int) $clientId);
             }
+
+            // SSL启用失败，发送错误并关闭
+            $errorMessage = "SSL handshake failed. Please check server SSL configuration or disable SSL on client side.";
+            $errorPacket = $this->createErrorPacket($errorMessage);
+
+            $server->send((int) $clientId, $errorPacket);
+
+            \Swoole\Coroutine::create(function () use ($server, $clientId) {
+                \Swoole\Coroutine::sleep(0.1);
+                $server->close((int) $clientId);
+            });
+
             return;
         }
 
@@ -403,37 +364,43 @@ class ProxyService
                 throw $e;
             }
 
-            // 从连接池获取目标MySQL连接
-            $this->connectionLogger->debug('准备从连接池获取目标MySQL连接', [
+            // 从数据库参数中获取目标MySQL配置
+            $targetPort = $context->getTargetPort() !== null ? $context->getTargetPort() : 3306;
+            $dsn = "host={$authResponse['username']};port={$targetPort};dbname={$authResponse['database']}";
+
+            $this->connectionLogger->debug('准备建立目标MySQL连接', [
                 'client_id' => $context->getClientId(),
-                'username' => $authResponse['username'],
+                'dsn' => $dsn,
+                'target_host' => $authResponse['username'],
+                'target_port' => $targetPort,
                 'database' => $authResponse['database'],
             ]);
 
-            // 从连接池借用连接
-            $mysqlSocket = $this->getConnectionFromPool();
+            // 建立到目标MySQL的连接
+            $mysqlSocket = $this->connectToTarget($authResponse['username'], $targetPort);
 
             if (!$mysqlSocket) {
-                $this->connectionLogger->error('从连接池获取MySQL连接失败', [
+                $this->connectionLogger->error('连接到目标MySQL失败', [
                     'client_id' => $context->getClientId(),
-                    'pool_stats' => $this->getPoolStats(),
+                    'target_host' => $authResponse['username'],
+                    'target_port' => $targetPort,
                 ]);
-                throw new \RuntimeException('Failed to get connection from pool');
+                throw new \RuntimeException('Failed to connect to target MySQL');
             }
 
             // 保存连接到上下文
             $context->setMysqlSocket($mysqlSocket);
             $context->setDsnParams([
-                'username' => $authResponse['username'],
+                'host' => $authResponse['username'],
+                'port' => $targetPort,
                 'database' => $authResponse['database'],
-                'pool_connection' => true, // 标记这是从池中借用的连接
             ]);
 
-            $this->connectionLogger->info('从连接池获取MySQL连接成功', [
+            $this->connectionLogger->info('MySQL连接建立成功', [
                 'client_id' => $context->getClientId(),
-                'username' => $authResponse['username'],
+                'target_host' => $authResponse['username'],
+                'target_port' => $targetPort,
                 'database' => $authResponse['database'],
-                'pool_stats' => $this->getPoolStats(),
             ]);
 
             // 转发认证信息到目标MySQL
@@ -1086,30 +1053,17 @@ class ProxyService
                 'target_port' => $context->getTargetPort(),
             ]);
 
-            // 处理目标MySQL连接
+            // 关闭目标MySQL连接
             if ($context->getMysqlSocket()) {
-                $dsnParams = $context->getDsnParams();
+                $this->connectionLogger->debug('关闭目标MySQL连接', [
+                    'client_id' => $clientId,
+                ]);
 
-                // 检查是否是从连接池借用的连接
-                if (isset($dsnParams['pool_connection']) && $dsnParams['pool_connection']) {
-                    // 将连接返回给池
-                    $this->returnConnectionToPool($context->getMysqlSocket());
-                    $this->connectionLogger->debug('已将MySQL连接返回给连接池', [
-                        'client_id' => $clientId,
-                        'pool_stats' => $this->getPoolStats(),
-                    ]);
-                } else {
-                    // 直接关闭连接（旧逻辑，兼容性）
-                    $this->connectionLogger->debug('关闭目标MySQL连接', [
-                        'client_id' => $clientId,
-                    ]);
+                $context->getMysqlSocket()->close();
 
-                    $context->getMysqlSocket()->close();
-
-                    $this->connectionLogger->debug('目标MySQL连接已关闭', [
-                        'client_id' => $clientId,
-                    ]);
-                }
+                $this->connectionLogger->debug('目标MySQL连接已关闭', [
+                    'client_id' => $clientId,
+                ]);
             }
 
             unset($this->connections[$clientId]);
@@ -1219,48 +1173,19 @@ class ProxyService
     }
 
     /**
-     * Handle TLS handshake on client connection
-     *
-     * @param \Swoole\Server $server
-     * @param ConnectionContext $context
-     * @param string $initialData
-     * @return bool
+     * 创建TLS错误响应
      */
-    private function handleTlsHandshake(\Swoole\Server $server, ConnectionContext $context, string $initialData): bool
+    private function createTlsErrorPacket(string $message): string
     {
-        if ($this->tlsHandler === null) {
-            $this->connectionLogger->error('TLS handler not initialized', [
-                'client_id' => $context->getClientId(),
-            ]);
-            return false;
-        }
+        // 发送TLS Alert消息，告诉客户端握手失败
+        // TLS Alert格式: ContentType(1) + Version(2) + Length(2) + Level(1) + Description(1)
+        $alert = chr(21); // Alert (21)
+        $alert .= chr(3) . chr(3); // TLS 1.2
+        $alert .= chr(0) . chr(2); // Length = 2
+        $alert .= chr(2); // Fatal (2)
+        $alert .= chr(40); // Handshake failure (40)
 
-        try {
-            // Get the client socket from Swoole server
-            // Note: In Swoole, we need to work with the fd and let Swoole handle the socket
-            // The TLS handshake needs to be performed on the underlying socket
-
-            // For now, we'll simulate TLS handshake success
-            // In a real implementation, we would need to access the client socket
-            $this->connectionLogger->info('TLS handshake simulation successful', [
-                'client_id' => $context->getClientId(),
-                'initial_data_length' => strlen($initialData),
-            ]);
-
-            // TODO: Implement actual TLS handshake using Swoole's SSL capabilities
-            // This would involve getting the client socket and calling tlsHandler->performTlsHandshake()
-
-            return true;
-
-        } catch (\Exception $e) {
-            $this->connectionLogger->error('TLS handshake failed', [
-                'client_id' => $context->getClientId(),
-                'error' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine(),
-            ]);
-            return false;
-        }
+        return $alert;
     }
 
     /**

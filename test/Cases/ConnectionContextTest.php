@@ -15,16 +15,16 @@ class ConnectionContextTest extends TestCase
 {
     public function testConnectionContextCreation()
     {
-        $context = new ConnectionContext('test_client_id', '192.168.1.1', 3306);
+        $context = new ConnectionContext(12345, '192.168.1.1', 3306);
 
-        $this->assertSame('test_client_id', $context->getClientId());
+        $this->assertSame('12345', $context->getClientId());
         $this->assertSame('192.168.1.1', $context->getClientIp());
         $this->assertSame(3306, $context->getClientPort());
     }
 
     public function testMysqlSocketManagement()
     {
-        $context = new ConnectionContext('test_client_id', '192.168.1.1', 3306);
+        $context = new ConnectionContext(12345, '192.168.1.1', 3306);
 
         $this->assertNull($context->getMysqlSocket());
 
@@ -37,7 +37,7 @@ class ConnectionContextTest extends TestCase
 
     public function testTransactionManagement()
     {
-        $context = new ConnectionContext('test_client_id', '192.168.1.1', 3306);
+        $context = new ConnectionContext(12345, '192.168.1.1', 3306);
 
         // 初始状态不在事务中
         $this->assertFalse($context->isInTransaction());
@@ -62,7 +62,7 @@ class ConnectionContextTest extends TestCase
 
     public function testDsnParamsManagement()
     {
-        $context = new ConnectionContext('test_client_id', '192.168.1.1', 3306);
+        $context = new ConnectionContext(12345, '192.168.1.1', 3306);
 
         // 初始为空数组
         $this->assertEmpty($context->getDsnParams());
@@ -76,7 +76,7 @@ class ConnectionContextTest extends TestCase
 
     public function testTargetConfiguration()
     {
-        $context = new ConnectionContext('test_client_id', '192.168.1.1', 3306);
+        $context = new ConnectionContext(12345, '192.168.1.1', 3306);
 
         // 初始值为 null
         $this->assertNull($context->getTargetHost());
@@ -92,7 +92,7 @@ class ConnectionContextTest extends TestCase
 
     public function testToStringConversion()
     {
-        $context = new ConnectionContext('test_client_id', '192.168.1.1', 3306);
+        $context = new ConnectionContext(12345, '192.168.1.1', 3306);
 
         $this->assertSame('192.168.1.1:3306', (string) $context);
     }

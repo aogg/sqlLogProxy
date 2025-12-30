@@ -62,13 +62,12 @@ class TargetConnector
                 return null;
             }
 
-            // Perform TLS handshake if required
+            // Note: TLS support is disabled for now due to Swoole API limitations
+            // TODO: Implement TLS support when Swoole API is available
             if ($this->useTls) {
-                if (!$this->performTlsHandshake($socket)) {
-                    error_log("TLS handshake failed to {$this->host}:{$this->port}");
-                    $socket->close();
-                    return null;
-                }
+                error_log("TLS connections are not supported in current Swoole version");
+                $socket->close();
+                return null;
             }
 
             return $socket;
@@ -79,48 +78,6 @@ class TargetConnector
         }
     }
 
-    /**
-     * Perform TLS handshake on the socket
-     *
-     * @param Socket $socket
-     * @return bool
-     */
-    private function performTlsHandshake(Socket $socket): bool
-    {
-        try {
-            // Enable SSL on the socket
-            $sslOptions = [
-                'ssl_verify_peer' => false, // In production, set to true and provide CA
-                'ssl_allow_self_signed' => true,
-                'ssl_host_name' => $this->host,
-            ];
-
-            if ($this->tlsCaFile) {
-                $sslOptions['ssl_cafile'] = $this->tlsCaFile;
-                $sslOptions['ssl_verify_peer'] = true;
-                $sslOptions['ssl_allow_self_signed'] = false;
-            }
-
-            if ($this->tlsCertFile && $this->tlsKeyFile) {
-                $sslOptions['ssl_cert_file'] = $this->tlsCertFile;
-                $sslOptions['ssl_key_file'] = $this->tlsKeyFile;
-            }
-
-            $socket->enableSSL($sslOptions);
-
-            // Perform SSL handshake
-            $result = $socket->sslHandshake();
-            if (!$result) {
-                return false;
-            }
-
-            return true;
-
-        } catch (\Exception $e) {
-            error_log("TLS handshake exception: " . $e->getMessage());
-            return false;
-        }
-    }
 
     /**
      * Create a connector from configuration

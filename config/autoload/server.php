@@ -38,9 +38,9 @@ return [
             'port' => (int)env('PROXY_PORT', 3307),
             'sock_type' => SWOOLE_SOCK_TCP,
             'callbacks' => [
-                Event::ON_CONNECT => [\App\Service\ProxyService::class, 'onConnect'],
-                Event::ON_RECEIVE => [\App\Service\ProxyService::class, 'onReceive'],
-                Event::ON_CLOSE => [\App\Service\ProxyService::class, 'onClose'],
+                Event::ON_CONNECT => [\App\Proxy\Service\MySQLProxyService::class, 'onConnect'],
+                Event::ON_RECEIVE => [\App\Proxy\Service\MySQLProxyService::class, 'onReceive'],
+                Event::ON_CLOSE => [\App\Proxy\Service\MySQLProxyService::class, 'onClose'],
             ],
             'options' => [
                 'open_eof_split' => false,

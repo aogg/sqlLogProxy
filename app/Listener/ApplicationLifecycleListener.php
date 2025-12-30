@@ -64,7 +64,7 @@ class ApplicationLifecycleListener implements ListenerInterface
             // 初始化连接池
             try {
                 $proxyService = $this->container->get(ProxyService::class);
-                $proxyService->initializeConnectionPool();
+                $proxyService->initialize();
 
                 $this->logger->info('连接池初始化完成', [
                     'event' => 'BeforeWorkerStart',

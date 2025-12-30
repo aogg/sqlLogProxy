@@ -9,7 +9,7 @@ use Swoole\Lock;
 
 class ConnectionContext
 {
-    private string $clientId;
+    private int $clientId;
     private string $clientIp;
     private int $clientPort;
     private ?Socket $mysqlSocket = null;
@@ -21,8 +21,13 @@ class ConnectionContext
     private bool $tlsEnabled = false;
     private ?string $clientTlsPeerCN = null;
     private ?Lock $socketLock = null;
+    private bool $authenticated = false;
+    private ?string $username = null;
+    private ?string $database = null;
+    private bool $sslRequested = false;
+    private string $authPluginData = '';
 
-    public function __construct(string $clientId, string $clientIp, int $clientPort)
+    public function __construct(int $clientId, string $clientIp, int $clientPort)
     {
         $this->clientId = $clientId;
         $this->clientIp = $clientIp;
@@ -30,6 +35,11 @@ class ConnectionContext
     }
 
     public function getClientId(): string
+    {
+        return (string) $this->clientId;
+    }
+
+    public function getThreadId(): int
     {
         return $this->clientId;
     }
@@ -137,6 +147,56 @@ class ConnectionContext
     public function setClientTlsPeerCN(?string $clientTlsPeerCN): void
     {
         $this->clientTlsPeerCN = $clientTlsPeerCN;
+    }
+
+    public function isAuthenticated(): bool
+    {
+        return $this->authenticated;
+    }
+
+    public function setAuthenticated(bool $authenticated): void
+    {
+        $this->authenticated = $authenticated;
+    }
+
+    public function getUsername(): ?string
+    {
+        return $this->username;
+    }
+
+    public function setUsername(?string $username): void
+    {
+        $this->username = $username;
+    }
+
+    public function getDatabase(): ?string
+    {
+        return $this->database;
+    }
+
+    public function setDatabase(?string $database): void
+    {
+        $this->database = $database;
+    }
+
+    public function isSslRequested(): bool
+    {
+        return $this->sslRequested;
+    }
+
+    public function setSslRequested(bool $sslRequested): void
+    {
+        $this->sslRequested = $sslRequested;
+    }
+
+    public function getAuthPluginData(): string
+    {
+        return $this->authPluginData;
+    }
+
+    public function setAuthPluginData(string $authPluginData): void
+    {
+        $this->authPluginData = $authPluginData;
     }
 
     public function __toString(): string

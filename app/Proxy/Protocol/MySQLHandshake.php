@@ -30,11 +30,16 @@ class MySQLHandshake
 
     /**
      * 创建服务器握手包
+     *
+     * @param int $threadId 线程/连接 id
+     * @param string|null $authPluginData 如果传入则使用该 auth 插件数据（保证握手与验证使用相同的 salt）
      */
-    public function createServerHandshake(int $threadId): Packet
+    public function createServerHandshake(int $threadId, ?string $authPluginData = null): Packet
     {
-        // 生成随机认证插件数据
-        $authPluginData = $this->generateAuthPluginData(20);
+        // 使用外部传入的 authPluginData（如果有），否则生成新的
+        if ($authPluginData === null) {
+            $authPluginData = $this->generateAuthPluginData(20);
+        }
         $authPluginData1 = substr($authPluginData, 0, 8);
         $authPluginDataLen = strlen($authPluginData);
         $authPluginData2 = substr($authPluginData, 8);
@@ -59,6 +64,8 @@ class MySQLHandshake
             'capabilities' => sprintf('0x%08x', self::CAPABILITIES),
             'charset' => self::CHARSET,
             'auth_plugin_data_length' => $authPluginDataLen,
+            // 为调试方便以 hex 形式记录 auth 插件数据（注意生产环境隐私）
+            'auth_plugin_data_hex' => bin2hex($authPluginData),
         ]);
 
         return Packet::create(0, $payload);

@@ -73,10 +73,10 @@ class ProxyAuthenticator
         // 验证密码
         $isValid = $this->verifyPassword($authResponse, $account['password'], $authPluginData);
 
-        $this->logger->info('代理账号验证结果，密码错误', [
+        $this->logger->info('代理账号验证结果', [
             'username' => $username,
             'database' => $database,
-            'is_valid' => $isValid,
+            '是否成功' => $isValid,
         ]);
 
         return $isValid;
@@ -122,6 +122,10 @@ class ProxyAuthenticator
         $isValid = hash_equals($expectedResponse, $clientAuthResponse);
 
         $this->logger->debug('密码验证详情', [
+            // 以 hex 形式记录二进制内容，便于对比与调试（生产请谨慎）
+            'auth_plugin_data_hex' => bin2hex($authPluginData),
+            'client_response_hex' => bin2hex($clientAuthResponse),
+            'expected_response_hex' => bin2hex($expectedResponse),
             'client_response_length' => mb_strlen($clientAuthResponse),
             'expected_response_length' => mb_strlen($expectedResponse),
             'responses_match' => $isValid,

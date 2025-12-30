@@ -48,8 +48,8 @@ class MySQLProxyService
             'remote_port' => $context->getClientPort(),
         ]);
 
-        // 生成并返回服务器握手包
-        return $this->handshake->createServerHandshake($context->getThreadId());
+        // 生成并返回服务器握手包，使用 context 中保存的 authPluginData（确保发送给客户端的 salt 与后续验证一致）
+        return $this->handshake->createServerHandshake($context->getThreadId(), $context->getAuthPluginData());
     }
 
     /**

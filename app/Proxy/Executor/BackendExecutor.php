@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace App\Proxy\Executor;
 
-use Hyperf\DB\DB;
+use Hyperf\DbConnection\Db;
 use App\Protocol\MySql\Packet;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
@@ -40,11 +40,19 @@ class BackendExecutor
 
         try {
             // 使用 Hyperf 数据库连接执行 SQL
+            /** @var \Hyperf\DbConnection\Connection $connection */
             $connection = DB::connection('backend_mysql');
 
             // 对于 SELECT 查询，使用 select 方法
-            if (stripos(trim($sql), 'select') === 0) {
+            // 支持前置注释（例如 MySQL Connector/J 会在前面带注释），所以使用正则去除注释后判断
+            if (preg_match('/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(select)\b/i', $sql) === 1) {
                 $result = $connection->select($sql);
+                // 某些 PDO 驱动或数据库层返回对象（stdClass），但下游期望关联数组
+                if (!empty($result)) {
+                    $result = array_map(function ($row) {
+                        return is_array($row) ? $row : (array) $row;
+                    }, $result);
+                }
 
                 $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
 
@@ -58,7 +66,22 @@ class BackendExecutor
             } else {
                 // 对于其他查询（如 INSERT, UPDATE, DELETE），使用 statement 方法
                 $affectedRows = $connection->statement($sql);
-                $lastInsertId = $connection->getPdo()->lastInsertId();
+                // 某些驱动 statement() 返回 bool 而非受影响行数，统一转换为 int
+                if (is_bool($affectedRows)) {
+                    $affectedRows = $affectedRows ? 1 : 0;
+                } else {
+                    $affectedRows = (int) $affectedRows;
+                }
+                // 尝试通过可用方法获取最后插入 ID
+                $lastInsertId = 0;
+                if (method_exists($connection, 'getPdo')) {
+                    $pdo = $connection->getPdo();
+                    if ($pdo instanceof \PDO) {
+                        $lastInsertId = (int) $pdo->lastInsertId();
+                    }
+                } elseif (method_exists($connection, 'lastInsertId')) {
+                    $lastInsertId = (int) $connection->lastInsertId();
+                }
 
                 $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
 
@@ -236,14 +259,25 @@ class BackendExecutor
     {
         // 使用 Hyperf 的连接池统计
         try {
+            /** @var \Hyperf\DbConnection\Connection $connection */
             $connection = DB::connection('backend_mysql');
-            $pool = $connection->getPool();
+            // 使用动态检测以兼容不同 DB 实现
+            if (method_exists($connection, 'getPool')) {
+                $pool = $connection->getPool();
+                return [
+                    'pool_type' => 'hyperf',
+                    'pool_name' => 'backend_mysql',
+                    'connections_count' => $pool->getConnectionsCount(),
+                    'idle_connections_count' => $pool->getIdleConnectionsCount(),
+                ];
+            }
 
+            // 如果没有 pool 支持，则返回基础信息
             return [
                 'pool_type' => 'hyperf',
                 'pool_name' => 'backend_mysql',
-                'connections_count' => $pool->getConnectionsCount(),
-                'idle_connections_count' => $pool->getIdleConnectionsCount(),
+                'connections_count' => null,
+                'idle_connections_count' => null,
             ];
         } catch (\Throwable $e) {
             return [

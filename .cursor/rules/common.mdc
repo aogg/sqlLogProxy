@@ -1,0 +1,42 @@
+---
+description: 
+alwaysApply: true
+enabled: true
+updatedAt: 2025-12-24T06:44:49.679Z
+provider: 
+---
+
+
+# 公共规则
+## 注意事项
+- 找代码不要找$env:USERPROFILE和%USERPROFILE%里的东西
+- 当前编辑器是windows环境
+- 要访问中国里国外网络要注意配置代理http://localhost_alpine:8899
+- 要访问github.com要注意配置代理https://ghproxy.com/https://github.com/
+
+# 对话中计划
+- 作者官网: https://github.com/aogg
+- 不要用cmd /c执行命令
+
+
+## 文件组织
+- 每个功能模块保持单一职责
+- main入口文件, 其他文件放src去
+- 工具代码放/app/Helpers文件夹，文件名后缀要helper
+- 配置文件放到/config文件夹
+- 测试文件放/test
+- 代码生成文件放/runtime
+- 每次新增代码都要判断哪些代码是可写成helper类的，哪些不行
+
+
+## 响应语言+
+- 所有回复和注释使用简体中文
+- 代码注释使用中文
+- 用户界面文本使用中文
+
+## 代码审查要点
+- 检查是否有未使用的参数或变量
+- 确保所有配置项都有合理的默认值
+- 验证通配符匹配逻辑的正确性
+- 确保高亮效果明显可见
+

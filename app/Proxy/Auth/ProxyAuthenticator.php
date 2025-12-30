@@ -55,8 +55,8 @@ class ProxyAuthenticator
         $this->logger->debug('开始验证代理账号', [
             'username' => $username,
             'database' => $database,
-            'auth_response_length' => strlen($authResponse),
-            'auth_plugin_data_length' => strlen($authPluginData),
+            'auth_response_length' => mb_strlen($authResponse),
+            'auth_plugin_data_length' => mb_strlen($authPluginData),
         ]);
 
         // 查找匹配的代理账号
@@ -73,7 +73,7 @@ class ProxyAuthenticator
         // 验证密码
         $isValid = $this->verifyPassword($authResponse, $account['password'], $authPluginData);
 
-        $this->logger->info('代理账号验证结果', [
+        $this->logger->info('代理账号验证结果，密码错误', [
             'username' => $username,
             'database' => $database,
             'is_valid' => $isValid,
@@ -122,8 +122,8 @@ class ProxyAuthenticator
         $isValid = hash_equals($expectedResponse, $clientAuthResponse);
 
         $this->logger->debug('密码验证详情', [
-            'client_response_length' => strlen($clientAuthResponse),
-            'expected_response_length' => strlen($expectedResponse),
+            'client_response_length' => mb_strlen($clientAuthResponse),
+            'expected_response_length' => mb_strlen($expectedResponse),
             'responses_match' => $isValid,
         ]);
 

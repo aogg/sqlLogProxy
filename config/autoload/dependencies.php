@@ -14,6 +14,8 @@ use App\Proxy\Service\MySQLProxyService;
 use App\Proxy\Protocol\MySQLHandshake;
 use App\Proxy\Auth\ProxyAuthenticator;
 use App\Proxy\Executor\BackendExecutor;
+use App\Proxy\Client\ClientDetector;
+use App\Proxy\Client\ProtocolAdapter;
 
 return [
     // MySQL 代理服务组件
@@ -21,4 +23,8 @@ return [
     ProxyAuthenticator::class => ProxyAuthenticator::class,
     BackendExecutor::class => BackendExecutor::class,
     MySQLProxyService::class => MySQLProxyService::class,
+
+    // 客户端识别和适配组件
+    ClientDetector::class => ClientDetector::class,
+    ProtocolAdapter::class => ProtocolAdapter::class,
 ];

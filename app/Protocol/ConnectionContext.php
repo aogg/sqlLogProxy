@@ -6,6 +6,7 @@ namespace App\Protocol;
 
 use Swoole\Coroutine\Socket;
 use Swoole\Lock;
+use App\Proxy\Client\ClientType;
 
 class ConnectionContext
 {
@@ -26,6 +27,9 @@ class ConnectionContext
     private ?string $database = null;
     private bool $sslRequested = false;
     private string $authPluginData = '';
+    private ClientType $clientType = ClientType::UNKNOWN;
+    private ?string $clientVersion = null;
+    private array $clientCapabilities = [];
 
     public function __construct(int $clientId, string $clientIp, int $clientPort)
     {
@@ -197,6 +201,36 @@ class ConnectionContext
     public function setAuthPluginData(string $authPluginData): void
     {
         $this->authPluginData = $authPluginData;
+    }
+
+    public function getClientType(): ClientType
+    {
+        return $this->clientType;
+    }
+
+    public function setClientType(ClientType $clientType): void
+    {
+        $this->clientType = $clientType;
+    }
+
+    public function getClientVersion(): ?string
+    {
+        return $this->clientVersion;
+    }
+
+    public function setClientVersion(?string $clientVersion): void
+    {
+        $this->clientVersion = $clientVersion;
+    }
+
+    public function getClientCapabilities(): array
+    {
+        return $this->clientCapabilities;
+    }
+
+    public function setClientCapabilities(array $capabilities): void
+    {
+        $this->clientCapabilities = $capabilities;
     }
 
     public function __toString(): string

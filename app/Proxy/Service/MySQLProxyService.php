@@ -10,6 +10,8 @@ use App\Protocol\ConnectionContext;
 use App\Proxy\Protocol\MySQLHandshake;
 use App\Proxy\Auth\ProxyAuthenticator;
 use App\Proxy\Executor\BackendExecutor;
+use App\Proxy\Client\ClientDetector;
+use App\Proxy\Client\ProtocolAdapter;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
 
@@ -23,18 +25,24 @@ class MySQLProxyService
     private MySQLHandshake $handshake;
     private ProxyAuthenticator $authenticator;
     private BackendExecutor $executor;
+    private ClientDetector $clientDetector;
+    private ProtocolAdapter $protocolAdapter;
     private array $connections = [];
 
     public function __construct(
         LoggerFactory $loggerFactory,
         MySQLHandshake $handshake,
         ProxyAuthenticator $authenticator,
-        BackendExecutor $executor
+        BackendExecutor $executor,
+        ClientDetector $clientDetector,
+        ProtocolAdapter $protocolAdapter
     ) {
         $this->logger = $loggerFactory->get('proxy_service');
         $this->handshake = $handshake;
         $this->authenticator = $authenticator;
         $this->executor = $executor;
+        $this->clientDetector = $clientDetector;
+        $this->protocolAdapter = $protocolAdapter;
     }
 
     /**
@@ -96,11 +104,12 @@ class MySQLProxyService
      */
     private function handleHandshakeResponse(ConnectionContext $context, Packet $packet): ?array
     {
-        $response = $this->handshake->handleClientHandshakeResponse($packet);
+        $response = $this->handshake->handleClientHandshakeResponse($packet, $context, $this->clientDetector);
 
         if ($response['type'] === 'ssl_request') {
             $this->logger->info('客户端请求 SSL 连接', [
                 'client_id' => $context->getClientId(),
+                'client_type' => $context->getClientType()->value,
             ]);
 
             // 标记客户端需要 SSL
@@ -120,18 +129,54 @@ class MySQLProxyService
     private function handleAuthentication(ConnectionContext $context, Packet $packet): ?array
     {
         try {
-            // 解析认证信息
-            $authData = $this->handshake->handleClientHandshakeResponse($packet);
+            $this->logger->info('开始处理客户端认证请求', [
+                'client_id' => $context->getClientId(),
+                'packet_sequence_id' => $packet->getSequenceId(),
+                'packet_length' => strlen($packet->getPayload()),
+            ]);
+
+            // 解析认证信息并进行客户端检测
+            $authData = $this->handshake->handleClientHandshakeResponse($packet, $context, $this->clientDetector);
 
             if ($authData['type'] !== 'auth_response') {
+                $this->logger->warning('收到非认证响应数据包', [
+                    'client_id' => $context->getClientId(),
+                    'response_type' => $authData['type'],
+                ]);
                 throw new \RuntimeException('Invalid authentication data');
             }
 
             $username = $authData['username'];
             $authResponse = $authData['auth_response'];
             $database = $authData['database'] ?? '';
+            $authPluginName = $authData['auth_plugin_name'] ?? '';
+            $charset = $authData['charset'] ?? 0;
+            $maxPacketSize = $authData['max_packet_size'] ?? 0;
+
+            // 记录客户端发送的完整认证信息
+            $this->logger->info('客户端认证信息详情', [
+                'client_id' => $context->getClientId(),
+                'username' => $username,
+                'database' => $database,
+                'auth_plugin_name' => $authPluginName,
+                'charset' => $charset,
+                'charset_name' => $this->getCharsetName($charset),
+                'max_packet_size' => $maxPacketSize,
+                'auth_response_length' => strlen($authResponse),
+                'auth_response_hex' => bin2hex($authResponse),
+                'server_auth_plugin_data_hex' => bin2hex($context->getAuthPluginData()),
+                'has_database' => !empty($database),
+                'client_capabilities' => sprintf('0x%08x', $authData['capabilities'] ?? 0),
+            ]);
 
             // 验证代理账号
+            $this->logger->debug('开始验证代理账号', [
+                'client_id' => $context->getClientId(),
+                'username' => $username,
+                'database' => $database,
+                'auth_plugin_data_length' => strlen($context->getAuthPluginData()),
+            ]);
+
             $isValid = $this->authenticator->authenticate(
                 $username,
                 $authResponse,
@@ -219,14 +264,48 @@ class MySQLProxyService
      */
     private function handleQuery(ConnectionContext $context, string $sql): array
     {
+        // 从查询中检测客户端类型（如果还没检测到）
+        $this->clientDetector->detectFromQuery($context, $sql);
+
         $this->logger->info('执行 SQL 查询', [
             'client_id' => $context->getClientId(),
             'username' => $context->getUsername(),
+            'client_type' => $context->getClientType()->value,
+            'client_version' => $context->getClientVersion(),
             'sql' => $sql,
         ]);
 
         // 使用后端执行器执行 SQL
-        return $this->executor->execute($sql);
+        $packets = $this->executor->execute($sql);
+
+        // 根据客户端类型调整EOF包格式
+        $adjustedPackets = [];
+        foreach ($packets as $packet) {
+            $payload = $packet->getPayload();
+
+            // 检查是否是EOF包（payload以0xfe开头）
+            if (strlen($payload) > 0 && ord($payload[0]) === 0xfe) {
+                $this->logger->debug('检测到EOF包，开始调整格式', [
+                    'client_id' => $context->getClientId(),
+                    'client_type' => $context->getClientType()->value,
+                    'original_eof_hex' => bin2hex($payload),
+                ]);
+
+                // 调整EOF包格式
+                $adjustedPayload = $this->protocolAdapter->adjustEofPacket($context, $payload);
+
+                $this->logger->debug('EOF包格式已调整', [
+                    'client_id' => $context->getClientId(),
+                    'adjusted_eof_hex' => bin2hex($adjustedPayload),
+                ]);
+
+                $adjustedPackets[] = Packet::create($packet->getSequenceId(), $adjustedPayload);
+            } else {
+                $adjustedPackets[] = $packet;
+            }
+        }
+
+        return $adjustedPackets;
     }
 
     /**
@@ -285,6 +364,22 @@ class MySQLProxyService
         $payload .= $message; // error message
 
         return [Packet::create(0, $payload)];
+    }
+
+    /**
+     * 获取字符集名称
+     */
+    private function getCharsetName(int $charset): string
+    {
+        $charsetMap = [
+            33 => 'utf8_general_ci',
+            45 => 'utf8mb4_general_ci',
+            83 => 'utf8_bin',
+            192 => 'utf8mb4_0900_bin',
+            255 => 'utf8mb4_bin',
+        ];
+
+        return $charsetMap[$charset] ?? "charset_{$charset}";
     }
 
     /**

@@ -7,4 +7,5 @@ alwaysApply: true
 
 # hyperf注意
 - 日志记录必须使用hyperf/logger
+- 测试用例要用hyperf/testing，写到/test文件夹下
 

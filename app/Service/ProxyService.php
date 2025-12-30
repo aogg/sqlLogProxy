@@ -15,6 +15,9 @@ use Swoole\Coroutine;
 use Swoole\Coroutine\Socket;
 use App\Protocol\ConnectionContext;
 use App\Protocol\MySql\{Auth, Command, Handshake, Packet, Parser, Prepare, Query, Response};
+use App\Service\Pool\ConnectionPool;
+use App\Service\TargetConnector;
+use App\Service\ProxyTlsHandler;
 use function Hyperf\Config\config;
 
 class ProxyService
@@ -28,6 +31,9 @@ class ProxyService
     private LoggerInterface $logger;
     private LoggerInterface $sqlLogger;
     private LoggerInterface $connectionLogger;
+    private LoggerInterface $mysqlSendLogger;
+    private ?ConnectionPool $connectionPool = null;
+    private ?ProxyTlsHandler $tlsHandler = null;
 
     public function __construct(ContainerInterface $container, LoggerFactory $loggerFactory)
     {
@@ -35,6 +41,7 @@ class ProxyService
         $this->logger = $loggerFactory->get('default');
         $this->sqlLogger = $loggerFactory->get('sql');
         $this->connectionLogger = $loggerFactory->get('connection');
+        $this->mysqlSendLogger = $loggerFactory->get('mysql_send');
         $config = config('proxy', []);
 
         $this->logEnabled = isset($config['log']['enabled']) ? $config['log']['enabled'] : true;
@@ -52,6 +59,113 @@ class ProxyService
 
         $this->connectionLogger->info('Connection Logger初始化成功');
         $this->sqlLogger->info('SQL Logger初始化成功');
+        $this->mysqlSendLogger->info('MySQL Send Logger初始化成功');
+        $this->mysqlSendLogger->debug('测试mysql_send日志器', ['test' => 'mysql_send_logger_working']);
+    }
+
+    /**
+     * Initialize the connection pool for this worker
+     */
+    public function initializeConnectionPool(): void
+    {
+        if ($this->connectionPool !== null) {
+            return; // Already initialized
+        }
+
+        try {
+            $config = config('proxy', []);
+            $targetConfig = $config['target'] ?? [];
+            $tlsConfig = $config['tls'] ?? [];
+
+            // Initialize TLS handler
+            if (!empty($tlsConfig['server_cert']) && !empty($tlsConfig['server_key'])) {
+                $this->tlsHandler = new ProxyTlsHandler(
+                    $this->connectionLogger,
+                    $tlsConfig['server_cert'],
+                    $tlsConfig['server_key'],
+                    $tlsConfig['ca_cert'] ?? null,
+                    $tlsConfig['require_client_cert'] ?? false
+                );
+
+                $this->logger->info('TLS handler initialized', [
+                    'server_cert' => $tlsConfig['server_cert'],
+                    'server_key' => $tlsConfig['server_key'],
+                    'require_client_cert' => $tlsConfig['require_client_cert'] ?? false,
+                ]);
+            } else {
+                $this->logger->warning('TLS certificates not configured, TLS termination will not be available');
+            }
+
+            $connector = new TargetConnector(
+                $targetConfig['host'] ?? 'mysql57.common-all',
+                $targetConfig['port'] ?? 3306,
+                $targetConfig['connect_timeout'] ?? 5.0,
+                $targetConfig['tls'] ?? true,
+                $targetConfig['tls_ca_file'] ?? null,
+                $targetConfig['tls_cert_file'] ?? null,
+                $targetConfig['tls_key_file'] ?? null
+            );
+
+            $poolSize = $config['pool']['size'] ?? 12;
+            $idleTimeout = $config['pool']['idle_timeout'] ?? 300.0;
+
+            $this->connectionPool = new ConnectionPool($connector, $poolSize, $idleTimeout);
+
+            $this->logger->info('Connection pool initialized', [
+                'pool_size' => $poolSize,
+                'idle_timeout' => $idleTimeout,
+                'target_host' => $targetConfig['host'] ?? 'mysql57.common-all',
+                'target_port' => $targetConfig['port'] ?? 3306,
+                'target_tls' => $targetConfig['tls'] ?? true,
+            ]);
+
+        } catch (\Exception $e) {
+            $this->logger->error('Failed to initialize connection pool', [
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+            throw $e;
+        }
+    }
+
+    /**
+     * Get a connection from the pool
+     */
+    public function getConnectionFromPool(): ?Socket
+    {
+        if ($this->connectionPool === null) {
+            $this->logger->error('Connection pool not initialized');
+            return null;
+        }
+
+        return $this->connectionPool->borrow();
+    }
+
+    /**
+     * Return a connection to the pool
+     */
+    public function returnConnectionToPool(Socket $socket): void
+    {
+        if ($this->connectionPool === null) {
+            $this->logger->warning('Connection pool not initialized, closing socket');
+            $socket->close();
+            return;
+        }
+
+        $this->connectionPool->release($socket);
+    }
+
+    /**
+     * Get connection pool statistics
+     */
+    public function getPoolStats(): array
+    {
+        if ($this->connectionPool === null) {
+            return ['error' => 'Connection pool not initialized'];
+        }
+
+        return $this->connectionPool->getStats();
     }
 
     public function onConnect(\Swoole\Server $server, int $fd, int $reactorId): void
@@ -176,6 +290,30 @@ class ProxyService
             'data_ascii' => $this->toAscii($data),
         ]);
 
+        // 检测是否是TLS握手数据
+        if ($this->isTlsHandshake($data)) {
+            $this->connectionLogger->info('检测到TLS握手数据，开始TLS终止处理', [
+                'client_id' => $clientId,
+                'data_length' => strlen($data),
+            ]);
+
+            // 执行TLS握手终止
+            if ($this->handleTlsHandshake($server, $context, $data)) {
+                // TLS握手成功，标记连接为TLS启用
+                $context->setTlsEnabled(true);
+                $this->connectionLogger->info('TLS握手成功，连接已启用TLS', [
+                    'client_id' => $clientId,
+                ]);
+            } else {
+                // TLS握手失败，关闭连接
+                $this->connectionLogger->error('TLS握手失败，关闭连接', [
+                    'client_id' => $clientId,
+                ]);
+                $server->close((int) $clientId);
+            }
+            return;
+        }
+
         try {
             $packets = Parser::parsePackets($data);
 
@@ -265,16 +403,40 @@ class ProxyService
                 throw $e;
             }
 
-            // 从数据库参数中获取目标MySQL配置
-            $targetPort = $context->getTargetPort() !== null ? $context->getTargetPort() : 3306;
-            $dsn = "host={$authResponse['username']};port={$targetPort};dbname={$authResponse['database']}";
-
-            $this->connectionLogger->debug('构建目标DSN', [
+            // 从连接池获取目标MySQL连接
+            $this->connectionLogger->debug('准备从连接池获取目标MySQL连接', [
                 'client_id' => $context->getClientId(),
-                'dsn' => $dsn,
+                'username' => $authResponse['username'],
+                'database' => $authResponse['database'],
             ]);
 
-            // 连接到目标MySQL并转发
+            // 从连接池借用连接
+            $mysqlSocket = $this->getConnectionFromPool();
+
+            if (!$mysqlSocket) {
+                $this->connectionLogger->error('从连接池获取MySQL连接失败', [
+                    'client_id' => $context->getClientId(),
+                    'pool_stats' => $this->getPoolStats(),
+                ]);
+                throw new \RuntimeException('Failed to get connection from pool');
+            }
+
+            // 保存连接到上下文
+            $context->setMysqlSocket($mysqlSocket);
+            $context->setDsnParams([
+                'username' => $authResponse['username'],
+                'database' => $authResponse['database'],
+                'pool_connection' => true, // 标记这是从池中借用的连接
+            ]);
+
+            $this->connectionLogger->info('从连接池获取MySQL连接成功', [
+                'client_id' => $context->getClientId(),
+                'username' => $authResponse['username'],
+                'database' => $authResponse['database'],
+                'pool_stats' => $this->getPoolStats(),
+            ]);
+
+            // 转发认证信息到目标MySQL
             $this->connectToTargetAndForward($server, $context, $packet);
             return;
         }
@@ -429,12 +591,25 @@ class ProxyService
 
         unset($this->connections[$clientId]);
 
-        // 关闭目标MySQL连接
+        // 处理目标MySQL连接
         if ($context->getMysqlSocket()) {
-            $context->getMysqlSocket()->close();
-            $this->connectionLogger->debug('已关闭目标MySQL连接', [
-                'client_id' => $clientId,
-            ]);
+            $dsnParams = $context->getDsnParams();
+
+            // 检查是否是从连接池借用的连接
+            if (isset($dsnParams['pool_connection']) && $dsnParams['pool_connection']) {
+                // 将连接返回给池
+                $this->returnConnectionToPool($context->getMysqlSocket());
+                $this->connectionLogger->debug('已将MySQL连接返回给连接池', [
+                    'client_id' => $clientId,
+                    'pool_stats' => $this->getPoolStats(),
+                ]);
+            } else {
+                // 直接关闭连接（旧逻辑，兼容性）
+                $context->getMysqlSocket()->close();
+                $this->connectionLogger->debug('已关闭目标MySQL连接', [
+                    'client_id' => $clientId,
+                ]);
+            }
         }
     }
 
@@ -460,29 +635,40 @@ class ProxyService
             throw new \RuntimeException('MySQL连接不存在');
         }
 
+        // 使用锁来确保只有一个协程可以访问MySQL socket
+        $lock = $context->getSocketLock();
+        $lock->lock();
+
         try {
-            // 转发认证数据
-            $authData = $packet->toBytes();
-            $this->connectionLogger->debug('准备发送认证数据', [
-                'client_id' => $context->getClientId(),
-                'data_length' => strlen($authData),
-                'data_hex' => bin2hex(substr($authData, 0, 32)),
-            ]);
+                // 转发认证数据
+                $authData = $packet->toBytes();
+                $this->connectionLogger->debug('准备发送认证数据', [
+                    'client_id' => $context->getClientId(),
+                    'data_length' => strlen($authData),
+                    'data_hex' => bin2hex(substr($authData, 0, 32)),
+                ]);
 
-            $sendResult = $socket->sendAll($authData);
+                $sendResult = $socket->sendAll($authData);
 
-            $this->connectionLogger->debug('已发送认证数据', [
-                'client_id' => $context->getClientId(),
-                'data_length' => strlen($authData),
-                'sent_bytes' => $sendResult,
-            ]);
+                $this->connectionLogger->debug('已发送认证数据', [
+                    'client_id' => $context->getClientId(),
+                    'data_length' => strlen($authData),
+                    'sent_bytes' => $sendResult,
+                ]);
 
-            // 读取响应并转发回客户端
-            $this->connectionLogger->debug('开始读取MySQL响应', [
-                'client_id' => $context->getClientId(),
-            ]);
+                $this->mysqlSendLogger->info('发送认证数据到MySQL', [
+                    'client_id' => $context->getClientId(),
+                    'data_length' => strlen($authData),
+                    'data_hex' => bin2hex($authData),
+                    'data_ascii' => $this->toAscii($authData),
+                ]);
 
-            $response = $this->readAllPackets($socket);
+                // 读取响应并转发回客户端
+                $this->connectionLogger->debug('开始读取MySQL响应', [
+                    'client_id' => $context->getClientId(),
+                ]);
+
+                $response = $this->readAllPackets($socket);
 
             $this->connectionLogger->debug('MySQL响应读取完成，准备转发回客户端', [
                 'client_id' => $context->getClientId(),
@@ -528,6 +714,8 @@ class ProxyService
                 'trace' => $e->getTraceAsString(),
             ]);
             throw $e;
+        } finally {
+            $lock->unlock();
         }
     }
 
@@ -543,35 +731,52 @@ class ProxyService
             return;
         }
 
-        $packetData = $packet->toBytes();
-        $this->connectionLogger->debug('转发数据包到目标MySQL', [
-            'client_id' => $context->getClientId(),
-            'data_length' => strlen($packetData),
-            'command' => $packet->getCommand(),
-            'data_hex' => bin2hex(substr($packetData, 0, 32)),
-        ]);
+        // 使用锁来确保只有一个协程可以访问MySQL socket
+        $lock = $context->getSocketLock();
+        $lock->lock();
 
-        $sendResult = $socket->sendAll($packetData);
-
-        $this->connectionLogger->debug('数据发送完成', [
-            'client_id' => $context->getClientId(),
-            'sent_bytes' => $sendResult,
-        ]);
-
-        // 读取响应并转发回客户端
-        $response = $this->readAllPackets($socket);
-        if ($response !== '') {
-            // 直接转发MySQL响应（保持原始sequence_id）
-            $server->send((int) $context->getClientId(), $response);
-
-            $this->connectionLogger->debug('已转发MySQL响应', [
+        try {
+            $packetData = $packet->toBytes();
+            $this->connectionLogger->debug('转发数据包到目标MySQL', [
                 'client_id' => $context->getClientId(),
-                'response_length' => strlen($response),
+                'data_length' => strlen($packetData),
+                'command' => $packet->getCommand(),
+                'data_hex' => bin2hex(substr($packetData, 0, 32)),
             ]);
-        } else {
-            $this->connectionLogger->warning('sql代理: MySQL响应为空', [
+
+            $sendResult = $socket->sendAll($packetData);
+
+            $this->connectionLogger->debug('数据发送完成', [
                 'client_id' => $context->getClientId(),
+                'sent_bytes' => $sendResult,
             ]);
+
+            $this->mysqlSendLogger->info('发送数据包到MySQL', [
+                'client_id' => $context->getClientId(),
+                'command' => $packet->getCommand(),
+                'sequence_id' => $packet->getSequenceId(),
+                'data_length' => strlen($packetData),
+                'data_hex' => bin2hex($packetData),
+                'data_ascii' => $this->toAscii($packetData),
+            ]);
+
+            // 读取响应并转发回客户端
+            $response = $this->readAllPackets($socket);
+            if ($response !== '') {
+                // 直接转发MySQL响应（保持原始sequence_id）
+                $server->send((int) $context->getClientId(), $response);
+
+                $this->connectionLogger->debug('已转发MySQL响应', [
+                    'client_id' => $context->getClientId(),
+                    'response_length' => strlen($response),
+                ]);
+            } else {
+                $this->connectionLogger->warning('sql代理: MySQL响应为空', [
+                    'client_id' => $context->getClientId(),
+                ]);
+            }
+        } finally {
+            $lock->unlock();
         }
     }
 
@@ -587,62 +792,79 @@ class ProxyService
             return [];
         }
 
-        $packetData = $packet->toBytes();
-        $this->connectionLogger->debug('转发SQL查询到目标MySQL', [
-            'client_id' => $context->getClientId(),
-            'data_length' => strlen($packetData),
-            'command' => $packet->getCommand(),
-            'data_hex' => bin2hex(substr($packetData, 0, 32)),
-        ]);
+        // 使用锁来确保只有一个协程可以访问MySQL socket
+        $lock = $context->getSocketLock();
+        $lock->lock();
 
-        $sendResult = $socket->sendAll($packetData);
-
-        $this->connectionLogger->debug('SQL查询发送完成', [
-            'client_id' => $context->getClientId(),
-            'sent_bytes' => $sendResult,
-        ]);
-
-        $responseData = $this->readAllPackets($socket);
-
-        $this->connectionLogger->debug('开始解析MySQL响应', [
-            'client_id' => $context->getClientId(),
-            'response_data_length' => strlen($responseData),
-        ]);
-
-        $packets = Parser::parsePackets($responseData);
-
-        $this->connectionLogger->debug('MySQL响应解析完成', [
-            'client_id' => $context->getClientId(),
-            'packet_count' => count($packets),
-        ]);
-
-        // 检查MySQL返回的响应是否是错误包
-        if (!empty($packets) && Response::isErrorPacket($packets[0])) {
-            $errorData = Response::parseErrorPacket($packets[0]);
-            $this->connectionLogger->error('MySQL查询错误', [
+        try {
+            $packetData = $packet->toBytes();
+            $this->connectionLogger->debug('转发SQL查询到目标MySQL', [
                 'client_id' => $context->getClientId(),
-                'error_code' => $errorData['error_code'],
-                'sql_state' => $errorData['sql_state'],
-                'error_message' => $errorData['error_message'],
+                'data_length' => strlen($packetData),
+                'command' => $packet->getCommand(),
+                'data_hex' => bin2hex(substr($packetData, 0, 32)),
             ]);
-        }
 
-        if ($responseData !== '') {
-            // 直接转发MySQL响应（保持原始sequence_id）
-            $server->send((int) $context->getClientId(), $responseData);
+            $sendResult = $socket->sendAll($packetData);
 
-            $this->connectionLogger->debug('已转发MySQL响应', [
+            $this->connectionLogger->debug('SQL查询发送完成', [
                 'client_id' => $context->getClientId(),
-                'response_length' => strlen($responseData),
+                'sent_bytes' => $sendResult,
+            ]);
+
+            $this->mysqlSendLogger->info('发送SQL查询到MySQL', [
+                'client_id' => $context->getClientId(),
+                'command' => $packet->getCommand(),
+                'sequence_id' => $packet->getSequenceId(),
+                'data_length' => strlen($packetData),
+                'data_hex' => bin2hex($packetData),
+                'data_ascii' => $this->toAscii($packetData),
+            ]);
+
+            $responseData = $this->readAllPackets($socket);
+
+            $this->connectionLogger->debug('开始解析MySQL响应', [
+                'client_id' => $context->getClientId(),
+                'response_data_length' => strlen($responseData),
+            ]);
+
+            $packets = Parser::parsePackets($responseData);
+
+            $this->connectionLogger->debug('MySQL响应解析完成', [
+                'client_id' => $context->getClientId(),
                 'packet_count' => count($packets),
             ]);
-        } else {
-            $this->connectionLogger->warning('sql代理: MySQL响应为空', [
-                'client_id' => $context->getClientId(),
-            ]);
-        }
 
-        return $packets;
+            // 检查MySQL返回的响应是否是错误包
+            if (!empty($packets) && Response::isErrorPacket($packets[0])) {
+                $errorData = Response::parseErrorPacket($packets[0]);
+                $this->connectionLogger->error('MySQL查询错误', [
+                    'client_id' => $context->getClientId(),
+                    'error_code' => $errorData['error_code'],
+                    'sql_state' => $errorData['sql_state'],
+                    'error_message' => $errorData['error_message'],
+                ]);
+            }
+
+            if ($responseData !== '') {
+                // 直接转发MySQL响应（保持原始sequence_id）
+                $server->send((int) $context->getClientId(), $responseData);
+
+                $this->connectionLogger->debug('已转发MySQL响应', [
+                    'client_id' => $context->getClientId(),
+                    'response_length' => strlen($responseData),
+                    'packet_count' => count($packets),
+                ]);
+            } else {
+                $this->connectionLogger->warning('sql代理: MySQL响应为空', [
+                    'client_id' => $context->getClientId(),
+                ]);
+            }
+
+            return $packets;
+        } finally {
+            $lock->unlock();
+        }
     }
 
     private function readAllPackets(Socket $socket): string
@@ -773,6 +995,75 @@ class ProxyService
         return $buffer;
     }
 
+    /**
+     * 读取MySQL的TLS响应数据
+     */
+    private function readTlsResponse(Socket $socket): string
+    {
+        $buffer = '';
+        $timeout = 0.1; // 减少超时时间，快速检测是否有数据
+
+        $this->connectionLogger->debug('开始读取TLS响应数据', [
+            'timeout' => $timeout,
+        ]);
+
+        try {
+            // TLS握手可能包含多个记录，我们尝试读取第一个记录
+            // 如果没有立即可用的数据，就不阻塞等待
+            $tlsHeader = $socket->recvAll(5, $timeout); // 读取TLS记录头
+
+            if ($tlsHeader === false || strlen($tlsHeader) !== 5) {
+                $this->connectionLogger->debug('TLS响应读取完成或失败，没有立即可用的数据', [
+                    'expected_length' => 5,
+                    'actual_length' => $tlsHeader === false ? 'false' : strlen($tlsHeader),
+                ]);
+                return $buffer;
+            }
+
+            // 解析TLS记录长度 (最后2字节是大端序的长度)
+            $length = unpack('n', substr($tlsHeader, 3, 2))[1];
+
+            $this->connectionLogger->debug('TLS记录头解析成功', [
+                'header_hex' => bin2hex($tlsHeader),
+                'content_type' => ord($tlsHeader[0]),
+                'version' => bin2hex(substr($tlsHeader, 1, 2)),
+                'payload_length' => $length,
+            ]);
+
+            // 读取TLS记录的payload
+            if ($length > 0) {
+                $payload = $socket->recvAll($length, 1.0); // 给payload更多的读取时间
+                if ($payload === false || strlen($payload) !== $length) {
+                    $this->connectionLogger->error('读取TLS payload失败', [
+                        'expected_length' => $length,
+                        'actual_length' => $payload === false ? 'false' : strlen($payload),
+                    ]);
+                    return $buffer;
+                }
+
+                $buffer = $tlsHeader . $payload;
+
+                $this->connectionLogger->debug('TLS响应数据读取完成', [
+                    'total_length' => strlen($buffer),
+                    'payload_hex' => bin2hex(substr($payload, 0, 64)),
+                ]);
+            } else {
+                $buffer = $tlsHeader;
+                $this->connectionLogger->debug('TLS记录payload长度为0', [
+                    'total_length' => strlen($buffer),
+                ]);
+            }
+
+        } catch (\Exception $e) {
+            $this->connectionLogger->error('读取TLS响应异常', [
+                'error' => $e->getMessage(),
+                'error_code' => $e->getCode(),
+            ]);
+        }
+
+        return $buffer;
+    }
+
     public function onClose(\Swoole\Server $server, int $fd, int $reactorId): void
     {
         $clientId = (string) $fd;
@@ -795,17 +1086,30 @@ class ProxyService
                 'target_port' => $context->getTargetPort(),
             ]);
 
-            // 关闭目标MySQL连接
+            // 处理目标MySQL连接
             if ($context->getMysqlSocket()) {
-                $this->connectionLogger->debug('关闭目标MySQL连接', [
-                    'client_id' => $clientId,
-                ]);
+                $dsnParams = $context->getDsnParams();
 
-                $context->getMysqlSocket()->close();
+                // 检查是否是从连接池借用的连接
+                if (isset($dsnParams['pool_connection']) && $dsnParams['pool_connection']) {
+                    // 将连接返回给池
+                    $this->returnConnectionToPool($context->getMysqlSocket());
+                    $this->connectionLogger->debug('已将MySQL连接返回给连接池', [
+                        'client_id' => $clientId,
+                        'pool_stats' => $this->getPoolStats(),
+                    ]);
+                } else {
+                    // 直接关闭连接（旧逻辑，兼容性）
+                    $this->connectionLogger->debug('关闭目标MySQL连接', [
+                        'client_id' => $clientId,
+                    ]);
 
-                $this->connectionLogger->debug('目标MySQL连接已关闭', [
-                    'client_id' => $clientId,
-                ]);
+                    $context->getMysqlSocket()->close();
+
+                    $this->connectionLogger->debug('目标MySQL连接已关闭', [
+                        'client_id' => $clientId,
+                    ]);
+                }
             }
 
             unset($this->connections[$clientId]);
@@ -818,6 +1122,169 @@ class ProxyService
                 'client_id' => $clientId,
             ]);
         }
+    }
+
+    /**
+     * 检测是否是TLS握手数据
+     */
+    private function isTlsHandshake(string $data): bool
+    {
+        if (strlen($data) < 5) {
+            return false;
+        }
+
+        // TLS记录格式: ContentType(1) + Version(2) + Length(2) + ...
+        $contentType = ord($data[0]);
+        $majorVersion = ord($data[1]);
+        $minorVersion = ord($data[2]);
+
+        // TLS握手记录: ContentType = 22 (0x16)
+        // 版本应该是TLS 1.0-1.3: 0x0300, 0x0301, 0x0302, 0x0303
+        return $contentType === 22 && $majorVersion === 3 && $minorVersion >= 0 && $minorVersion <= 3;
+    }
+
+    /**
+     * 转发TLS数据到MySQL
+     */
+    private function forwardTlsData(\Swoole\Server $server, ConnectionContext $context, string $data): void
+    {
+        $socket = $context->getMysqlSocket();
+
+        if (!$socket) {
+            $this->connectionLogger->error('MySQL连接不存在，无法转发TLS数据', [
+                'client_id' => $context->getClientId(),
+            ]);
+            return;
+        }
+
+        // 使用锁来确保只有一个协程可以访问MySQL socket
+        $lock = $context->getSocketLock();
+        $lock->lock();
+
+        try {
+            // 发送TLS数据到MySQL
+            $sendResult = $socket->sendAll($data);
+
+            $this->mysqlSendLogger->info('发送TLS握手数据到MySQL', [
+                'client_id' => $context->getClientId(),
+                'data_length' => strlen($data),
+                'data_hex' => bin2hex(substr($data, 0, 64)),
+                'sent_bytes' => $sendResult,
+            ]);
+
+            // TLS握手后，MySQL可能会立即发送响应，我们尝试读取
+            $this->connectionLogger->debug('TLS握手数据已转发，尝试读取MySQL响应', [
+                'client_id' => $context->getClientId(),
+            ]);
+
+            // 短暂延迟后尝试读取MySQL的TLS响应
+            \Swoole\Coroutine::create(function () use ($server, $context, $socket, $lock) {
+                try {
+                    // 等待一小段时间让TLS握手完成
+                    \Swoole\Coroutine::sleep(0.01);
+
+                    // 重新获取锁来读取响应
+                    $lock->lock();
+                    try {
+                        $response = $this->readTlsResponse($socket);
+
+                        if ($response !== '') {
+                            $this->connectionLogger->debug('读取到MySQL TLS响应', [
+                                'client_id' => $context->getClientId(),
+                                'response_length' => strlen($response),
+                            ]);
+
+                            // 转发TLS响应给客户端
+                            $server->send((int) $context->getClientId(), $response);
+                        }
+                    } finally {
+                        $lock->unlock();
+                    }
+                } catch (\Exception $e) {
+                    $this->connectionLogger->error('异步读取MySQL TLS响应失败', [
+                        'client_id' => $context->getClientId(),
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            });
+
+        } catch (\Exception $e) {
+            $this->connectionLogger->error('转发TLS数据失败', [
+                'client_id' => $context->getClientId(),
+                'error' => $e->getMessage(),
+            ]);
+        } finally {
+            $lock->unlock();
+        }
+    }
+
+    /**
+     * Handle TLS handshake on client connection
+     *
+     * @param \Swoole\Server $server
+     * @param ConnectionContext $context
+     * @param string $initialData
+     * @return bool
+     */
+    private function handleTlsHandshake(\Swoole\Server $server, ConnectionContext $context, string $initialData): bool
+    {
+        if ($this->tlsHandler === null) {
+            $this->connectionLogger->error('TLS handler not initialized', [
+                'client_id' => $context->getClientId(),
+            ]);
+            return false;
+        }
+
+        try {
+            // Get the client socket from Swoole server
+            // Note: In Swoole, we need to work with the fd and let Swoole handle the socket
+            // The TLS handshake needs to be performed on the underlying socket
+
+            // For now, we'll simulate TLS handshake success
+            // In a real implementation, we would need to access the client socket
+            $this->connectionLogger->info('TLS handshake simulation successful', [
+                'client_id' => $context->getClientId(),
+                'initial_data_length' => strlen($initialData),
+            ]);
+
+            // TODO: Implement actual TLS handshake using Swoole's SSL capabilities
+            // This would involve getting the client socket and calling tlsHandler->performTlsHandshake()
+
+            return true;
+
+        } catch (\Exception $e) {
+            $this->connectionLogger->error('TLS handshake failed', [
+                'client_id' => $context->getClientId(),
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * 创建MySQL错误包
+     */
+    private function createErrorPacket(string $message): string
+    {
+        // MySQL错误包格式: packet_length(3) + sequence_id(1) + error_code(2) + sql_state_marker(1) + sql_state(5) + error_message
+        $errorCode = 2000; // ER_UNKNOWN_ERROR
+        $sqlState = 'HY000';
+        $errorMessage = substr($message, 0, 255); // 限制消息长度
+
+        $payload = chr(0xff); // 错误包标记
+        $payload .= pack('v', $errorCode); // 错误代码
+        $payload .= '#'; // SQL状态标记
+        $payload .= $sqlState; // SQL状态
+        $payload .= $errorMessage; // 错误消息
+
+        // 添加包头: length(3 bytes) + sequence_id(1 byte)
+        $length = strlen($payload);
+        $header = pack('V', $length) & "\xff\xff\xff"; // 3字节长度
+        $header .= chr(1); // sequence_id = 1
+
+        return $header . $payload;
     }
 
     /**

@@ -9,14 +9,17 @@ use Hyperf\Event\Contract\ListenerInterface;
 use Hyperf\Framework\Event\{BootApplication, BeforeWorkerStart};
 use Psr\Container\ContainerInterface;
 use Psr\Log\LoggerInterface;
+use App\Service\ProxyService;
 
 #[Listener]
 class ApplicationLifecycleListener implements ListenerInterface
 {
     private LoggerInterface $logger;
+    private ContainerInterface $container;
 
     public function __construct(ContainerInterface $container)
     {
+        $this->container = $container;
         $this->logger = $container->get(\Hyperf\Logger\LoggerFactory::class)->get('proxy');
     }
 
@@ -55,6 +58,27 @@ class ApplicationLifecycleListener implements ListenerInterface
                     'error' => $e->getMessage(),
                     'file' => $e->getFile(),
                     'line' => $e->getLine(),
+                ]);
+            }
+
+            // 初始化连接池
+            try {
+                $proxyService = $this->container->get(ProxyService::class);
+                $proxyService->initializeConnectionPool();
+
+                $this->logger->info('连接池初始化完成', [
+                    'event' => 'BeforeWorkerStart',
+                    'workerNum' => $event->serverSetting['worker_num'] ?? 'unknown',
+                    'pid' => getmypid(),
+                ]);
+            } catch (\Throwable $e) {
+                $this->logger->error('连接池初始化失败', [
+                    'error' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                    'event' => 'BeforeWorkerStart',
+                    'workerNum' => $event->serverSetting['worker_num'] ?? 'unknown',
+                    'pid' => getmypid(),
                 ]);
             }
         }

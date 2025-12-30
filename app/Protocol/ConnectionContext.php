@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Protocol;
 
 use Swoole\Coroutine\Socket;
+use Swoole\Lock;
 
 class ConnectionContext
 {
@@ -17,6 +18,9 @@ class ConnectionContext
     private array $dsnParams = [];
     private ?string $targetHost = null;
     private ?int $targetPort = null;
+    private bool $tlsEnabled = false;
+    private ?string $clientTlsPeerCN = null;
+    private ?Lock $socketLock = null;
 
     public function __construct(string $clientId, string $clientIp, int $clientPort)
     {
@@ -105,6 +109,34 @@ class ConnectionContext
     public function setTargetPort(int $port): void
     {
         $this->targetPort = $port;
+    }
+
+    public function getSocketLock(): Lock
+    {
+        if ($this->socketLock === null) {
+            $this->socketLock = new Lock(SWOOLE_MUTEX);
+        }
+        return $this->socketLock;
+    }
+
+    public function isTlsEnabled(): bool
+    {
+        return $this->tlsEnabled;
+    }
+
+    public function setTlsEnabled(bool $tlsEnabled): void
+    {
+        $this->tlsEnabled = $tlsEnabled;
+    }
+
+    public function getClientTlsPeerCN(): ?string
+    {
+        return $this->clientTlsPeerCN;
+    }
+
+    public function setClientTlsPeerCN(?string $clientTlsPeerCN): void
+    {
+        $this->clientTlsPeerCN = $clientTlsPeerCN;
     }
 
     public function __toString(): string

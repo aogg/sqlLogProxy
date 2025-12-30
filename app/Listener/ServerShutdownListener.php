@@ -47,7 +47,6 @@ class ServerShutdownListener implements ListenerInterface
             $this->logger->info("Worker进程已停止", [
                 'pid' => getmypid(),
                 'worker_id' => $workerId,
-                'worker_type' => $event->workerType,
                 'event' => 'OnWorkerStop',
             ]);
         }
@@ -57,9 +56,7 @@ class ServerShutdownListener implements ListenerInterface
             $this->logger->info("Worker进程正在退出", [
                 'pid' => getmypid(),
                 'worker_id' => $workerId,
-                'worker_type' => $event->workerType,
                 'event' => 'OnWorkerExit',
-                'exit_code' => $event->exitCode ?? 'unknown',
             ]);
         }
     }

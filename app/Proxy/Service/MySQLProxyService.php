@@ -312,6 +312,9 @@ class MySQLProxyService
                 case 'execute':
                     return $this->handleExecute($context, $parsedCommand['data']);
 
+                case 'use':
+                    return $this->handleUse($context, $parsedCommand['database']);
+
                 case 'ping':
                     return $this->handlePing($context);
 
@@ -420,6 +423,31 @@ class MySQLProxyService
         ]);
 
         // 返回 OK 包表示连接正常
+        return [Auth::createOkPacket()];
+    }
+
+    /**
+     * 处理 use 命令（选择数据库）
+     */
+    private function handleUse(ConnectionContext $context, string $database): array
+    {
+        $this->logger->info('处理 USE 命令，选择数据库', [
+            'client_id' => $context->getClientId(),
+            'username' => $context->getUsername(),
+            'old_database' => $context->getDatabase(),
+            'new_database' => $database,
+        ]);
+
+        // 设置新的数据库
+        $context->setDatabase($database);
+
+        $this->logger->info('数据库切换成功', [
+            'client_id' => $context->getClientId(),
+            'username' => $context->getUsername(),
+            'current_database' => $context->getDatabase(),
+        ]);
+
+        // 返回 OK 包表示切换成功
         return [Auth::createOkPacket()];
     }
 

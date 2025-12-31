@@ -6,6 +6,9 @@ namespace App\Proxy\Service;
 
 use App\Protocol\MySql\Packet;
 use App\Protocol\MySql\Parser;
+use App\Protocol\MySql\Auth;
+use App\Protocol\MySql\Prepare;
+use App\Protocol\MySql\Execute;
 use App\Protocol\ConnectionContext;
 use App\Proxy\Protocol\MySQLHandshake;
 use App\Proxy\Auth\ProxyAuthenticator;
@@ -14,6 +17,8 @@ use App\Proxy\Client\ClientDetector;
 use App\Proxy\Client\ProtocolAdapter;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
+use Swoole\Coroutine\Socket;
+use function Hyperf\Config\config;
 
 /**
  * MySQL TLS 代理服务
@@ -48,7 +53,7 @@ class MySQLProxyService
     /**
      * 处理客户端连接
      */
-    public function handleConnect(ConnectionContext $context): Packet
+    public function handleConnect(ConnectionContext $context): ?Packet
     {
         $this->logger->info('客户端连接，开始发送握手包', [
             'client_id' => $context->getClientId(),
@@ -56,8 +61,24 @@ class MySQLProxyService
             'remote_port' => $context->getClientPort(),
         ]);
 
-        // 生成并返回服务器握手包，使用 context 中保存的 authPluginData（确保发送给客户端的 salt 与后续验证一致）
-        return $this->handshake->createServerHandshake($context->getThreadId(), $context->getAuthPluginData());
+        // 生成 authPluginData
+        // MySQL 5.7.44 使用 21 字节的 auth_plugin_data（8 + 13）
+        $authPluginData = $this->handshake->generateAuthPluginData(21);
+        $context->setAuthPluginData($authPluginData);
+
+        // 立即发送握手包
+        $handshakePacket = $this->handshake->createServerHandshake(
+            (int) $context->getThreadId(),
+            $authPluginData
+        );
+
+        $this->logger->info('已创建服务器握手包', [
+            'client_id' => $context->getClientId(),
+            'auth_plugin_data_hex' => bin2hex($authPluginData),
+            'packet_length' => strlen($handshakePacket->toBytes()),
+        ]);
+
+        return $handshakePacket;
     }
 
     /**
@@ -112,11 +133,11 @@ class MySQLProxyService
                 'client_type' => $context->getClientType()->value,
             ]);
 
-            // 标记客户端需要 SSL
+            // 标记客户端需要 SSL - 不返回SSL切换包，上层ProxyService将在socket上启用TLS
             $context->setSslRequested(true);
 
-            // 返回 SSL 切换包
-            return [$this->handshake->createSslSwitchPacket()];
+            // 返回空数组，表示SSL请求已处理，不需要发送MySQL协议包
+            return [];
         }
 
         // 如果不是 SSL 请求，说明是直接的认证信息
@@ -168,6 +189,26 @@ class MySQLProxyService
                 'has_database' => !empty($database),
                 'client_capabilities' => sprintf('0x%08x', $authData['capabilities'] ?? 0),
             ]);
+
+            // 当启用 CLIENT_PLUGIN_AUTH 时，第一个包的 auth_response 可能为空
+            // 实际的认证响应会在第二个包（sequence_id=2）中发送
+            // 检查是否是第一个包（auth_response_length=0 且已经解析出了用户名）
+            if (strlen($authResponse) === 0 && !empty($username)) {
+                $this->logger->info('收到第一个认证包，等待第二个包', [
+                    'client_id' => $context->getClientId(),
+                    'username' => $username,
+                    'sequence_id' => $packet->getSequenceId(),
+                ]);
+
+                // 保存已解析的信息到上下文，等待第二个包
+                $context->setUsername($username);
+                if (!empty($database)) {
+                    $context->setDatabase($database);
+                }
+
+                // 返回空数组，表示不需要发送响应包
+                return [];
+            }
 
             // 验证代理账号
             $this->logger->debug('开始验证代理账号', [
@@ -237,6 +278,15 @@ class MySQLProxyService
                 case 'query':
                     return $this->handleQuery($context, $parsedCommand['sql']);
 
+                case 'prepare':
+                    return $this->handlePrepare($context, $parsedCommand['sql']);
+
+                case 'execute':
+                    return $this->handleExecute($context, $parsedCommand['data']);
+
+                case 'ping':
+                    return $this->handlePing($context);
+
                 case 'quit':
                     $this->handleQuit($context);
                     return null; // 连接将关闭
@@ -276,7 +326,7 @@ class MySQLProxyService
         ]);
 
         // 使用后端执行器执行 SQL
-        $packets = $this->executor->execute($sql);
+        $packets = $this->executor->execute($sql, $context->getDatabase());
 
         // 根据客户端类型调整EOF包格式
         $adjustedPackets = [];
@@ -320,6 +370,85 @@ class MySQLProxyService
 
         // 清理上下文
         $context->setAuthenticated(false);
+    }
+
+    /**
+     * 处理 ping 命令
+     */
+    private function handlePing(ConnectionContext $context): array
+    {
+        $this->logger->debug('处理 ping 命令', [
+            'client_id' => $context->getClientId(),
+            'username' => $context->getUsername(),
+        ]);
+
+        // 返回 OK 包表示连接正常
+        return [Auth::createOkPacket()];
+    }
+
+    /**
+     * 处理预编译语句准备命令
+     */
+    private function handlePrepare(ConnectionContext $context, string $sql): array
+    {
+        $this->logger->info('收到预处理语句准备请求', [
+            'client_id' => $context->getClientId(),
+            'username' => $context->getUsername(),
+            'sql' => $sql,
+        ]);
+
+        // 转发到后端执行
+        $packets = $this->executor->executePrepare($sql, $context->getDatabase());
+
+        // 注册预处理语句
+        if (!empty($packets)) {
+            $prepareResp = Prepare::parsePrepareResponse($packets[0]);
+            $stmtId = $prepareResp['statement_id'];
+            $numParams = $prepareResp['num_params'];
+
+            Parser::registerPreparedStatement($stmtId, $sql);
+            Parser::setPreparedStatementParamCount($stmtId, $numParams);
+
+            $this->logger->debug('预处理语句注册成功', [
+                'client_id' => $context->getClientId(),
+                'statement_id' => $stmtId,
+                'num_params' => $numParams,
+                'sql' => $sql,
+            ]);
+        }
+
+        return $packets;
+    }
+
+    /**
+     * 处理预编译语句执行命令
+     */
+    private function handleExecute(ConnectionContext $context, array $data): array
+    {
+        $stmtId = $data['statement_id'];
+        $sql = Parser::getPreparedStatement($stmtId);
+
+        $this->logger->info('收到预处理语句执行请求', [
+            'client_id' => $context->getClientId(),
+            'username' => $context->getUsername(),
+            'statement_id' => $stmtId,
+            'sql' => $sql,
+        ]);
+
+        // 记录执行日志
+        if ($sql) {
+            $this->logger->info('预处理语句执行', [
+                'client_id' => $context->getClientId(),
+                'username' => $context->getUsername(),
+                'client_type' => $context->getClientType()->value,
+                'client_version' => $context->getClientVersion(),
+                'sql' => "[EXECUTE] " . $sql,
+                'statement_id' => $stmtId,
+            ]);
+        }
+
+        // 转发到后端执行
+        return $this->executor->executeExecute($data, $context->getDatabase());
     }
 
     /**
@@ -420,7 +549,8 @@ class MySQLProxyService
     /**
      * 处理连接事件
      */
-    public function onConnect(\Swoole\Server $server, int $fd, int $reactorId): void
+    public function onConnect(
+\Swoole\Server $server, int $fd, int $reactorId): void
     {
         $this->logger->info('=== 新客户端连接 ===', [
             'fd' => $fd,
@@ -442,19 +572,30 @@ class MySQLProxyService
 
         // 创建连接上下文
         $context = new ConnectionContext($clientId, $remoteIp, $remotePort);
-        $context->setAuthPluginData($this->handshake->generateAuthPluginData());
+        // 使用 21 字节的 auth_plugin_data（MySQL 5.7.44 要求）
+        $authPluginData = $this->handshake->generateAuthPluginData(21);
+        $context->setAuthPluginData($authPluginData);
 
         $this->connections[$clientId] = $context;
 
-        // 发送服务器握手包
+        // 立即发送服务器握手包
         try {
             $handshakePacket = $this->handleConnect($context);
-            $server->send($fd, $handshakePacket->toBytes());
-
-            $this->logger->info('握手包已发送', [
-                'client_id' => $clientId,
-                'packet_length' => strlen($handshakePacket->toBytes()),
-            ]);
+            if ($handshakePacket !== null && ($handshakePacket instanceof Packet)) {
+                try {
+                    $server->send($fd, $handshakePacket->toBytes());
+                    $this->logger->info('握手包已发送', [
+                        'client_id' => $clientId,
+                        'packet_length' => strlen($handshakePacket->toBytes()),
+                    ]);
+                } catch (\Throwable $e) {
+                    $this->logger->error('发送握手包异常', [
+                        'client_id' => $clientId,
+                        'error' => $e->getMessage(),
+                    ]);
+                    $server->close($fd);
+                }
+            }
         } catch (\Exception $e) {
             $this->logger->error('发送握手包失败', [
                 'client_id' => $clientId,
@@ -488,6 +629,12 @@ class MySQLProxyService
             return;
         }
 
+        // 标记已收到客户端首包（用于 onConnect 的超时逻辑判断）
+        try {
+            $context->setFirstPacketReceived(true);
+        } catch (\Throwable $_) {
+        }
+
         try {
             // 解析数据包
             $packets = Parser::parsePackets($data);
@@ -505,6 +652,17 @@ class MySQLProxyService
                     // 连接将关闭
                     $server->close($fd);
                     return;
+                }
+
+                // 检查是否需要启用SSL
+                if ($context->isSslRequested()) {
+                    $this->logger->info('检测到SSL请求，启用TLS握手', [
+                        'client_id' => $clientId,
+                    ]);
+
+                    // 在当前socket上启用TLS
+                    $this->enableTlsOnSocket($server, $fd, $context);
+                    return; // TLS启用后，不再发送MySQL协议包
                 }
 
                 // 发送响应包
@@ -550,6 +708,100 @@ class MySQLProxyService
             ]);
 
             unset($this->connections[$clientId]);
+        }
+    }
+
+    /**
+     * 在指定socket上启用TLS
+     */
+    private function enableTlsOnSocket(\Swoole\Server $server, int $fd, ConnectionContext $context): void
+    {
+        $clientId = (string) $fd;
+
+        try {
+            // 获取客户端socket信息
+            $clientInfo = $server->getClientInfo($fd);
+            if (!$clientInfo || !isset($clientInfo['socket_fd'])) {
+                throw new \RuntimeException('无法获取客户端socket信息');
+            }
+
+            // 创建TLS处理器
+            $tlsConfig = config('proxy.tls', []);
+            if (empty($tlsConfig['server_cert']) || empty($tlsConfig['server_key'])) {
+                throw new \RuntimeException('TLS证书未配置');
+            }
+
+            $tlsHandler = new \App\Service\ProxyTlsHandler(
+                $this->logger,
+                $tlsConfig['server_cert'],
+                $tlsConfig['server_key'],
+                $tlsConfig['ca_cert'] ?? null,
+                $tlsConfig['require_client_cert'] ?? false
+            );
+
+            // 创建Swoole socket并启用TLS（以现有 socket fd 创建协程 socket）
+            $swooleSocket = new \Swoole\Coroutine\Socket((int) $clientInfo['socket_fd'], AF_INET, SOCK_STREAM);
+
+            $this->logger->debug('开始TLS握手', [
+                'client_id' => $clientId,
+                'socket_fd' => $clientInfo['socket_fd'],
+            ]);
+
+            // 执行TLS握手
+            $tlsSuccess = $tlsHandler->performTlsHandshake($swooleSocket);
+
+            if ($tlsSuccess) {
+                $this->logger->info('TLS握手成功，标记上下文为SSL已启用', [
+                    'client_id' => $clientId,
+                ]);
+
+                // 标记TLS已启用
+                $context->setTlsEnabled(true);
+
+                // TLS握手完成后，客户端会继续发送加密的MySQL认证数据
+                // 这里不需要发送任何响应，下次收到数据时会是加密的认证信息
+            } else {
+                $this->logger->warning('TLS握手失败，关闭连接', [
+                    'client_id' => $clientId,
+                ]);
+
+                // 发送错误信息并关闭连接
+                $errorMessage = "SSL handshake failed. Please check server SSL configuration or disable SSL on client side.";
+                $errorPackets = $this->createErrorPackets($errorMessage);
+                $server->send($fd, $errorPackets[0]->toBytes());
+
+                // 延迟关闭连接
+                \Swoole\Coroutine::create(function () use ($server, $fd) {
+                    \Swoole\Coroutine::sleep(0.1);
+                    $server->close($fd);
+                });
+            }
+
+        } catch (\Exception $e) {
+            $this->logger->error('启用TLS异常', [
+                'client_id' => $clientId,
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            // 发送错误并关闭连接
+            try {
+                $errorMessage = "SSL handshake failed: " . $e->getMessage();
+                $errorPackets = $this->createErrorPackets($errorMessage);
+                $server->send($fd, $errorPackets[0]->toBytes());
+            } catch (\Exception $sendError) {
+                $this->logger->error('发送TLS错误响应失败', [
+                    'client_id' => $clientId,
+                    'error' => $sendError->getMessage(),
+                ]);
+            }
+
+            // 延迟关闭连接
+            \Swoole\Coroutine::create(function () use ($server, $fd) {
+                \Swoole\Coroutine::sleep(0.1);
+                $server->close($fd);
+            });
         }
     }
 }

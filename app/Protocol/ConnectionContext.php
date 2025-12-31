@@ -26,6 +26,7 @@ class ConnectionContext
     private ?string $username = null;
     private ?string $database = null;
     private bool $sslRequested = false;
+    private bool $firstPacketReceived = false;
     private string $authPluginData = '';
     private ClientType $clientType = ClientType::UNKNOWN;
     private ?string $clientVersion = null;
@@ -191,6 +192,16 @@ class ConnectionContext
     public function setSslRequested(bool $sslRequested): void
     {
         $this->sslRequested = $sslRequested;
+    }
+
+    public function isFirstPacketReceived(): bool
+    {
+        return $this->firstPacketReceived;
+    }
+
+    public function setFirstPacketReceived(bool $received): void
+    {
+        $this->firstPacketReceived = $received;
     }
 
     public function getAuthPluginData(): string

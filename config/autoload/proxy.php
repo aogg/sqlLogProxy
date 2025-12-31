@@ -8,17 +8,6 @@ return [
     // 监听端口
     'port' => env('PROXY_PORT', 3306),
 
-    // 目标MySQL服务器配置
-    'target' => [
-        'host' => env('TARGET_MYSQL_HOST', 'mysql57.common-all'),
-        'port' => env('TARGET_MYSQL_PORT', 3306),
-        'connect_timeout' => 5.0,
-        'tls' => true, // 是否对目标MySQL使用TLS
-        'tls_ca_file' => null, // CA证书文件路径
-        'tls_cert_file' => null, // 客户端证书文件路径
-        'tls_key_file' => null, // 客户端私钥文件路径
-    ],
-
     // 连接池配置
     'pool' => [
         'size' => 12, // 每Worker连接池大小

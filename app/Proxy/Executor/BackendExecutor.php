@@ -6,6 +6,7 @@ namespace App\Proxy\Executor;
 
 use Hyperf\DbConnection\Db;
 use App\Protocol\MySql\Packet;
+use App\Protocol\MySql\Parser;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
 
@@ -28,9 +29,10 @@ class BackendExecutor
      * 执行 SQL 语句
      *
      * @param string $sql 要执行的 SQL 语句
+     * @param string|null $database 要使用的数据库名
      * @return array 执行结果，包含 MySQL 协议包
      */
-    public function execute(string $sql): array
+    public function execute(string $sql, ?string $database = null): array
     {
         $startTime = microtime(true);
 
@@ -42,6 +44,14 @@ class BackendExecutor
             // 使用 Hyperf 数据库连接执行 SQL
             /** @var \Hyperf\DbConnection\Connection $connection */
             $connection = DB::connection('backend_mysql');
+
+            // 如果指定了数据库，先切换到该数据库
+            if ($database !== null && $database !== '') {
+                $connection->statement("USE `{$database}`");
+                $this->logger->debug('已切换到数据库', [
+                    'database' => $database,
+                ]);
+            }
 
             // 对于 SELECT 查询，使用 select 方法
             // 支持前置注释（例如 MySQL Connector/J 会在前面带注释），所以使用正则去除注释后判断
@@ -56,10 +66,29 @@ class BackendExecutor
 
                 $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
 
+                // 记录返回结果摘要（最多前3行数据，避免日志过大）
+                $resultSummary = [];
+                if (!empty($result)) {
+                    $maxRows = min(3, count($result));
+                    for ($i = 0; $i < $maxRows; $i++) {
+                        $row = $result[$i];
+                        // 只记录前5个字段，避免单行过长
+                        $rowSummary = [];
+                        $fieldCount = 0;
+                        foreach ($row as $key => $value) {
+                            if ($fieldCount >= 5) break;
+                            $rowSummary[$key] = is_scalar($value) ? $value : gettype($value);
+                            $fieldCount++;
+                        }
+                        $resultSummary[] = $rowSummary;
+                    }
+                }
+
                 $this->logger->info('后端 SELECT 查询执行成功', [
                     'sql' => $sql,
                     'elapsed_ms' => $elapsedMs,
                     'result_count' => count($result),
+                    'result_summary' => $resultSummary,
                 ]);
 
                 return $this->createResultSetPackets($result);
@@ -85,8 +114,21 @@ class BackendExecutor
 
                 $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
 
+                // 识别SQL语句类型
+                $sqlType = 'UNKNOWN';
+                if (preg_match('/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(insert)\b/i', $sql)) {
+                    $sqlType = 'INSERT';
+                } elseif (preg_match('/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(update)\b/i', $sql)) {
+                    $sqlType = 'UPDATE';
+                } elseif (preg_match('/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(delete)\b/i', $sql)) {
+                    $sqlType = 'DELETE';
+                } elseif (preg_match('/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(create|alter|drop)\b/i', $sql)) {
+                    $sqlType = 'DDL';
+                }
+
                 $this->logger->info('后端查询执行成功', [
                     'sql' => $sql,
+                    'sql_type' => $sqlType,
                     'elapsed_ms' => $elapsedMs,
                     'affected_rows' => $affectedRows,
                     'last_insert_id' => $lastInsertId,
@@ -284,5 +326,179 @@ class BackendExecutor
                 'error' => 'Failed to get pool stats: ' . $e->getMessage()
             ];
         }
+    }
+
+    /**
+     * 执行预编译语句准备
+     */
+    public function executePrepare(string $sql, ?string $database = null): array
+    {
+        $startTime = microtime(true);
+
+        $this->logger->info('开始执行预编译语句准备', [
+            'sql' => $sql,
+        ]);
+
+        try {
+            /** @var \Hyperf\DbConnection\Connection $connection */
+            $connection = DB::connection('backend_mysql');
+
+            // 如果指定了数据库，先切换到该数据库
+            if ($database !== null && $database !== '') {
+                $connection->statement("USE `{$database}`");
+                $this->logger->debug('已切换到数据库', [
+                    'database' => $database,
+                ]);
+            }
+
+            if (method_exists($connection, 'getPdo')) {
+                $pdo = $connection->getPdo();
+                if ($pdo instanceof \PDO) {
+                    $stmt = $pdo->prepare($sql);
+
+                    // 获取statement_id - 这是一个简化的实现
+                    // 在真实的MySQL协议中，statement_id由服务器分配
+                    // 这里我们使用一个模拟的ID
+                    $stmtId = crc32($sql) & 0x7FFFFFFF; // 确保是正数
+
+                    $this->logger->info('预编译语句准备成功', [
+                        'sql' => $sql,
+                        'elapsed_ms' => (int) ((microtime(true) - $startTime) * 1000),
+                        'statement_id' => $stmtId,
+                    ]);
+
+                    // 创建简化的PREPARE响应包
+                    return $this->createPrepareResponsePacket($stmtId, $stmt);
+                }
+            }
+
+            throw new \RuntimeException('无法获取PDO连接');
+
+        } catch (\Throwable $e) {
+            $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
+
+            $this->logger->error('预编译语句准备失败', [
+                'sql' => $sql,
+                'error' => $e->getMessage(),
+                'elapsed_ms' => $elapsedMs,
+            ]);
+
+            return $this->createErrorPackets(2001, 'Prepare failed: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * 执行预编译语句执行
+     */
+    public function executeExecute(array $data, ?string $database = null): array
+    {
+        $stmtId = $data['statement_id'];
+        $parameters = $data['parameters'] ?? [];
+        $startTime = microtime(true);
+
+        $this->logger->info('开始执行预编译语句', [
+            'statement_id' => $stmtId,
+            'parameter_count' => count($parameters),
+        ]);
+
+        try {
+            /** @var \Hyperf\DbConnection\Connection $connection */
+            $connection = DB::connection('backend_mysql');
+
+            // 如果指定了数据库，先切换到该数据库
+            if ($database !== null && $database !== '') {
+                $connection->statement("USE `{$database}`");
+                $this->logger->debug('已切换到数据库', [
+                    'database' => $database,
+                ]);
+            }
+
+            if (method_exists($connection, 'getPdo')) {
+                $pdo = $connection->getPdo();
+                if ($pdo instanceof \PDO) {
+                    $sql = Parser::getPreparedStatement($stmtId);
+                    if (!$sql) {
+                        throw new \RuntimeException('未找到预编译语句');
+                    }
+
+                    // 使用PDO准备语句并绑定参数
+                    $stmt = $pdo->prepare($sql);
+
+                    // 绑定参数
+                    foreach ($parameters as $index => $value) {
+                        $paramIndex = $index + 1; // PDO参数索引从1开始
+                        $stmt->bindValue($paramIndex, $value);
+                    }
+
+                    $stmt->execute();
+
+                    // 检查是否有结果集
+                    $hasResultSet = false;
+                    try {
+                        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+                        $hasResultSet = true;
+                    } catch (\PDOException $e) {
+                        // 如果没有结果集（例如INSERT/UPDATE/DELETE语句），获取受影响行数
+                        if (strpos($e->getMessage(), 'no result set') !== false) {
+                            $affectedRows = $stmt->rowCount();
+                            $lastInsertId = (int) $pdo->lastInsertId();
+
+                            $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
+
+                            $this->logger->info('预编译语句执行成功 (无结果集)', [
+                                'statement_id' => $stmtId,
+                                'elapsed_ms' => $elapsedMs,
+                                'affected_rows' => $affectedRows,
+                                'last_insert_id' => $lastInsertId,
+                            ]);
+
+                            return $this->createOkPacket($affectedRows, $lastInsertId);
+                        } else {
+                            throw $e;
+                        }
+                    }
+
+                    if ($hasResultSet) {
+                        $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
+
+                        $this->logger->info('预编译语句执行成功', [
+                            'statement_id' => $stmtId,
+                            'elapsed_ms' => $elapsedMs,
+                            'result_count' => count($result),
+                        ]);
+
+                        return $this->createResultSetPackets($result);
+                    }
+                }
+            }
+
+            throw new \RuntimeException('无法获取PDO连接');
+
+        } catch (\Throwable $e) {
+            $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
+
+            $this->logger->error('预编译语句执行失败', [
+                'statement_id' => $stmtId,
+                'error' => $e->getMessage(),
+                'elapsed_ms' => $elapsedMs,
+            ]);
+
+            return $this->createErrorPackets(2002, 'Execute failed: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * 创建预编译响应包
+     */
+    private function createPrepareResponsePacket(int $stmtId, \PDOStatement $stmt): array
+    {
+        // MySQL PREPARE 响应格式 (简化版)
+        $payload = pack('V', $stmtId);        // statement_id (4 bytes)
+        $payload .= pack('v', 0);             // num_columns (2 bytes) - 简化
+        $payload .= pack('v', 0);             // num_params (2 bytes) - 简化
+        $payload .= chr(0);                   // reserved (1 byte)
+        $payload .= pack('v', 0);             // warning_count (2 bytes)
+
+        return [Packet::create(0, $payload)];
     }
 }

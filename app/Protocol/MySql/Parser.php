@@ -7,6 +7,7 @@ namespace App\Protocol\MySql;
 class Parser
 {
     private static array $preparedStatements = [];
+    private static array $preparedStatementParamCounts = [];
 
     public static function parsePackets(string $data): array
     {
@@ -104,5 +105,23 @@ class Parser
     public static function clearPreparedStatements(): void
     {
         self::$preparedStatements = [];
+        self::$preparedStatementParamCounts = [];
+    }
+
+    public static function getPreparedStatementParamCount(int $statementId): int
+    {
+        return isset(self::$preparedStatementParamCounts[$statementId])
+            ? self::$preparedStatementParamCounts[$statementId]
+            : 0;
+    }
+
+    public static function setPreparedStatementParamCount(int $statementId, int $count): void
+    {
+        self::$preparedStatementParamCounts[$statementId] = $count;
+    }
+
+    public static function removePreparedStatementParamCount(int $statementId): void
+    {
+        unset(self::$preparedStatementParamCounts[$statementId]);
     }
 }

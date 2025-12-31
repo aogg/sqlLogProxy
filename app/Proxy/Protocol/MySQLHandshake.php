@@ -20,8 +20,9 @@ class MySQLHandshake
     private const SERVER_VERSION = '5.7.44-sqlLogProxy';
     private const CHARSET = 33; // utf8mb4_general_ci
 
-    // MySQL 客户端能力标志，支持 SSL 和其他必要功能
-    private const CAPABILITIES = 0x00aff7df; // 包含 CLIENT_SSL (2048)
+    // MySQL 客户端能力标志（服务端侧）
+    // 基本标志：CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_LONG_FLAG
+    private const CAPABILITIES = 0x00aff7df;
 
     private LoggerInterface $logger;
 
@@ -39,35 +40,56 @@ class MySQLHandshake
     public function createServerHandshake(int $threadId, ?string $authPluginData = null): Packet
     {
         // 使用外部传入的 authPluginData（如果有），否则生成新的
+        // MySQL 5.7.44 实际使用 21 字节的 auth_plugin_data（8 + 13，包含 NUL）
         if ($authPluginData === null) {
-            $authPluginData = $this->generateAuthPluginData(20);
+            $authPluginData = $this->generateAuthPluginData(21);
         }
-        $authPluginData1 = substr($authPluginData, 0, 8);
+
         $authPluginDataLen = strlen($authPluginData);
+
+        // 分割 auth_plugin_data
+        // 前8字节作为 auth_plugin_data1，后13字节作为 auth_plugin_data2
+        $authPluginData1 = substr($authPluginData, 0, 8);
         $authPluginData2 = substr($authPluginData, 8);
 
         $payload = chr(self::PROTOCOL_VERSION); // Protocol Version
         $payload .= self::SERVER_VERSION . "\x00"; // Server Version
         $payload .= pack('V', $threadId); // Thread ID
-        $payload .= $authPluginData1; // Auth Plugin Data Part 1
-        $payload .= "\x00"; // Filler
+        $payload .= $authPluginData1; // Auth Plugin Data Part 1 (8 bytes)
+        $payload .= "\x00"; // Filler (1 byte)
         $payload .= pack('v', self::CAPABILITIES & 0xffff); // Capability Flags Lower
         $payload .= chr(self::CHARSET); // Character Set
         $payload .= pack('v', 0); // Status Flags
-        $payload .= pack('v', (self::CAPABILITIES >> 16) & 0xffff); // Capability Flags Upper
-        $payload .= chr($authPluginDataLen); // Auth Plugin Data Length
-        $payload .= str_repeat("\x00", 10); // Reserved
-        $payload .= $authPluginData2; // Auth Plugin Data Part 2
-        $payload .= 'mysql_native_password' . "\x00"; // Auth Plugin Name
+        $payload .= pack('v', self::CAPABILITIES >> 16); // Capability Flags Upper (full upper 16 bits)
+
+        // 根据 CLIENT_PLUGIN_AUTH 标志决定使用哪种格式
+        if (self::CAPABILITIES & 0x00080000) {
+            // 启用 CLIENT_PLUGIN_AUTH：发送 authDataLength 和 10 字节保留区
+            $payload .= chr($authPluginDataLen); // Auth Plugin Data Length (1 byte)
+            $payload .= str_repeat("\x00", 10); // Reserved (10 bytes)
+        } else {
+            // 不启用 CLIENT_PLUGIN_AUTH：发送 13 字节 FILLER
+            $payload .= str_repeat("\x00", 13); // Filler (13 bytes)
+        }
+
+        $payload .= $authPluginData2; // Auth Plugin Data Part 2 (remaining bytes)
+
+        // 只有启用 CLIENT_PLUGIN_AUTH 时才发送 pluginName
+        if (self::CAPABILITIES & 0x00080000) {
+            $payload .= 'mysql_native_password' . "\x00"; // Auth Plugin Name
+        }
 
         $this->logger->debug('创建服务器握手包', [
             'thread_id' => $threadId,
             'server_version' => self::SERVER_VERSION,
             'capabilities' => sprintf('0x%08x', self::CAPABILITIES),
             'charset' => self::CHARSET,
-            'auth_plugin_data_length' => $authPluginDataLen,
-            // 为调试方便以 hex 形式记录 auth 插件数据（注意生产环境隐私）
-            'auth_plugin_data_hex' => bin2hex($authPluginData),
+            'auth_plugin_data_total_length' => $authPluginDataLen,
+            'auth_plugin_data1_length' => strlen($authPluginData1),
+            'auth_plugin_data2_length' => strlen($authPluginData2),
+            'payload_length' => strlen($payload),
+            'auth_data1_hex' => bin2hex($authPluginData1),
+            'auth_data2_hex' => bin2hex($authPluginData2),
         ]);
 
         return Packet::create(0, $payload);
@@ -297,11 +319,14 @@ class MySQLHandshake
 
     /**
      * 生成认证插件数据
+     * MySQL 5.7.44 要求 auth_plugin_data 长度为 21 字节（8 + 13）
      */
-    public function generateAuthPluginData(int $length = 20): string
+    public function generateAuthPluginData(int $length = 21): string
     {
         $data = '';
         for ($i = 0; $i < $length; $i++) {
+            // 使用安全的ASCII字符（不包括控制字符）
+            // 范围：0x21-0x7e (33-126)
             $data .= chr(mt_rand(33, 126));
         }
         return $data;

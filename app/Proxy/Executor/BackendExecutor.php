@@ -189,7 +189,9 @@ class BackendExecutor
         // Column Definition Packets
         $sequenceId = 1;
         foreach ($columns as $column) {
-            $packets[] = Packet::create($sequenceId++, $this->createColumnDefinition($column));
+            // 确保列名是字符串类型
+            $columnName = is_string($column) ? $column : 'expr';
+            $packets[] = Packet::create($sequenceId++, $this->createColumnDefinition($columnName));
         }
 
         // EOF Packet after columns

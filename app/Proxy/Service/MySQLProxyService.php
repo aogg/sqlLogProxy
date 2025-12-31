@@ -194,6 +194,34 @@ class MySQLProxyService
             // 实际的认证响应会在第二个包（sequence_id=2）中发送
             // 检查是否是第一个包（auth_response_length=0 且已经解析出了用户名）
             if (strlen($authResponse) === 0 && !empty($username)) {
+                // 检查该用户的密码是否为空
+                $proxyAccounts = config('proxy.proxy_accounts', []);
+                $isEmptyPassword = false;
+                foreach ($proxyAccounts as $account) {
+                    if (($account['username'] ?? '') === $username && empty($account['password'] ?? '')) {
+                        $isEmptyPassword = true;
+                        break;
+                    }
+                }
+
+                if ($isEmptyPassword) {
+                    $this->logger->info('收到空密码认证，直接认证成功', [
+                        'client_id' => $context->getClientId(),
+                        'username' => $username,
+                        'sequence_id' => $packet->getSequenceId(),
+                    ]);
+
+                    // 标记认证成功
+                    $context->setAuthenticated(true);
+                    $context->setUsername($username);
+                    if (!empty($database)) {
+                        $context->setDatabase($database);
+                    }
+
+                    // 返回认证成功包
+                    return $this->createAuthSuccessPackets();
+                }
+
                 $this->logger->info('收到第一个认证包，等待第二个包', [
                     'client_id' => $context->getClientId(),
                     'username' => $username,
@@ -241,7 +269,7 @@ class MySQLProxyService
                 return $this->createAuthSuccessPackets();
 
             } else {
-                $this->logger->warning('代理认证失败', [
+                $this->logger->warning('代理认证失败  Access denied for user', [
                     'client_id' => $context->getClientId(),
                     'username' => $username,
                 ]);
@@ -328,32 +356,41 @@ class MySQLProxyService
         // 使用后端执行器执行 SQL
         $packets = $this->executor->execute($sql, $context->getDatabase());
 
-        // 根据客户端类型调整EOF包格式
+        // 调整包的sequence_id，从客户端命令包的sequence_id + 1开始
         $adjustedPackets = [];
+        $startSequenceId = 1; // 响应包从sequence_id=1开始
+
         foreach ($packets as $packet) {
-            $payload = $packet->getPayload();
-
-            // 检查是否是EOF包（payload以0xfe开头）
-            if (strlen($payload) > 0 && ord($payload[0]) === 0xfe) {
-                $this->logger->debug('检测到EOF包，开始调整格式', [
-                    'client_id' => $context->getClientId(),
-                    'client_type' => $context->getClientType()->value,
-                    'original_eof_hex' => bin2hex($payload),
-                ]);
-
-                // 调整EOF包格式
-                $adjustedPayload = $this->protocolAdapter->adjustEofPacket($context, $payload);
-
-                $this->logger->debug('EOF包格式已调整', [
-                    'client_id' => $context->getClientId(),
-                    'adjusted_eof_hex' => bin2hex($adjustedPayload),
-                ]);
-
-                $adjustedPackets[] = Packet::create($packet->getSequenceId(), $adjustedPayload);
-            } else {
-                $adjustedPackets[] = $packet;
-            }
+            $adjustedPackets[] = Packet::create($startSequenceId++, $packet->getPayload());
         }
+
+        // 记录所有返回的数据包
+        $this->logger->info('准备返回数据包给客户端', [
+            'client_id' => $context->getClientId(),
+            'packet_count' => count($adjustedPackets),
+            'packets_info' => array_map(function($packet) {
+                return [
+                    'sequence_id' => $packet->getSequenceId(),
+                    'payload_length' => strlen($packet->getPayload()),
+                    'payload_hex' => bin2hex(substr($packet->getPayload(), 0, 32)) . (strlen($packet->getPayload()) > 32 ? '...' : ''),
+                ];
+            }, $adjustedPackets),
+        ]);
+
+        return $adjustedPackets;
+
+        // 记录所有返回的数据包
+        $this->logger->info('准备返回数据包给客户端', [
+            'client_id' => $context->getClientId(),
+            'packet_count' => count($adjustedPackets),
+            'packets_info' => array_map(function($packet) {
+                return [
+                    'sequence_id' => $packet->getSequenceId(),
+                    'payload_length' => strlen($packet->getPayload()),
+                    'payload_hex' => bin2hex(substr($packet->getPayload(), 0, 32)) . (strlen($packet->getPayload()) > 32 ? '...' : ''),
+                ];
+            }, $adjustedPackets),
+        ]);
 
         return $adjustedPackets;
     }
@@ -666,8 +703,23 @@ class MySQLProxyService
                 }
 
                 // 发送响应包
-                foreach ($responsePackets as $responsePacket) {
-                    $server->send($fd, $responsePacket->toBytes());
+                $this->logger->info('开始发送响应包给客户端', [
+                    'client_id' => $clientId,
+                    'packet_count' => count($responsePackets),
+                ]);
+                foreach ($responsePackets as $index => $responsePacket) {
+                    $packetBytes = $responsePacket->toBytes();
+                    $this->logger->debug('发送数据包', [
+                        'client_id' => $clientId,
+                        'packet_index' => $index,
+                        'packet_length' => strlen($packetBytes),
+                        'packet_hex' => bin2hex($packetBytes),
+                        'sequence_id' => $responsePacket->getSequenceId(),
+                        'payload_length' => $responsePacket->getLength(),
+                    ]);
+                    $server->send($fd, $packetBytes);
+                    // 添加短暂延迟，防止包发送太快导致客户端解析问题
+                    usleep(1000); // 1 毫秒
                 }
             }
 

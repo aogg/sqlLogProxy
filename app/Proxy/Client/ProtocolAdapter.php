@@ -71,10 +71,15 @@ class ProtocolAdapter
      */
     private function createPhpCompatibleEof(): string
     {
-        // PHP PDO 可能更宽松，但为了兼容性也使用完整格式
-        $eof = "\xfe\x00\x00\x00\x22";
+        // 使用标准的 5 字节 EOF 包格式（MySQL 4.1+）
+        // 0xfe + 2字节警告计数(小端序) + 2字节状态标志(小端序)
+        // 状态标志 0x0002 表示 SERVER_STATUS_AUTOCOMMIT
+        $eof = "\xfe\x00\x00\x02\x00";
         $this->logger->debug('生成 PHP PDO 兼容的EOF包', [
             'eof_hex' => bin2hex($eof),
+            'eof_length' => strlen($eof),
+            'warning_count' => 0,
+            'status_flags' => 0x0002,
         ]);
         return $eof;
     }

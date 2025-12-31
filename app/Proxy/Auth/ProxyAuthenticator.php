@@ -136,6 +136,7 @@ class ProxyAuthenticator
 
     /**
      * 计算 MySQL native password 认证响应
+     * 注意：MySQL客户端只使用auth_plugin_data的前20字节进行认证
      */
     private function calculateAuthResponse(string $password, string $authPluginData): string
     {
@@ -143,16 +144,19 @@ class ProxyAuthenticator
             return '';
         }
 
+        // MySQL客户端只使用前20字节的auth_plugin_data进行认证
+        $authDataForClient = substr($authPluginData, 0, 20);
+
         // SHA1(password)
         $hash1 = sha1($password, true);
 
         // SHA1(SHA1(password))
         $hash2 = sha1($hash1, true);
 
-        // SHA1(auth_plugin_data + SHA1(SHA1(password)))
-        $hash3 = sha1($authPluginData . $hash2, true);
+        // SHA1(auth_plugin_data[0..19] + SHA1(SHA1(password)))
+        $hash3 = sha1($authDataForClient . $hash2, true);
 
-        // XOR: SHA1(password) ^ SHA1(auth_plugin_data + SHA1(SHA1(password)))
+        // XOR: SHA1(password) ^ SHA1(auth_plugin_data[0..19] + SHA1(SHA1(password)))
         $response = $hash1 ^ $hash3;
 
         return $response;

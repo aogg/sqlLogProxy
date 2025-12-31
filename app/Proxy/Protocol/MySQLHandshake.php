@@ -301,7 +301,7 @@ class MySQLHandshake
         ]);
 
         // 记录客户端连接属性（如果支持）
-        if ($capabilities & 0x00100000) { // CLIENT_CONNECT_ATTRS
+        if ($capabilities & 0x00100000 && $offset < $payloadLength) { // CLIENT_CONNECT_ATTRS
             $this->logClientConnectionAttributes($payload, $offset);
         }
 
@@ -607,9 +607,12 @@ class MySQLHandshake
             $payloadLength = strlen($payload);
 
             while ($offset < $payloadLength) {
-                // 读取属性名长度
-                $nameLen = ord($payload[$offset]);
-                $offset++;
+                // 读取属性名长度 (length-encoded integer)
+                $nameLenResult = $this->readLengthEncodedInteger($payload, $offset, $payloadLength);
+                if ($nameLenResult === null) {
+                    break;
+                }
+                $nameLen = $nameLenResult;
 
                 if ($offset + $nameLen > $payloadLength) {
                     break;
@@ -619,9 +622,12 @@ class MySQLHandshake
                 $name = substr($payload, $offset, $nameLen);
                 $offset += $nameLen;
 
-                // 读取属性值长度
-                $valueLen = ord($payload[$offset]);
-                $offset++;
+                // 读取属性值长度 (length-encoded integer)
+                $valueLenResult = $this->readLengthEncodedInteger($payload, $offset, $payloadLength);
+                if ($valueLenResult === null) {
+                    break;
+                }
+                $valueLen = $valueLenResult;
 
                 if ($offset + $valueLen > $payloadLength) {
                     break;
@@ -651,6 +657,43 @@ class MySQLHandshake
                 'payload_length' => $payloadLength,
             ]);
         }
+    }
+
+    /**
+     * 读取 length-encoded integer
+     * 返回 null 如果没有足够的字节
+     */
+    private function readLengthEncodedInteger(string $payload, int &$offset, int $payloadLength): ?int
+    {
+        if ($offset >= $payloadLength) {
+            return null;
+        }
+
+        $firstByte = ord($payload[$offset]);
+        $offset++;
+
+        if ($firstByte < 251) {
+            return $firstByte;
+        } elseif ($firstByte == 251) {
+            return null; // NULL
+        } elseif ($firstByte == 252) {
+            if ($offset + 2 > $payloadLength) return null;
+            $value = unpack('v', substr($payload, $offset, 2))[1];
+            $offset += 2;
+            return $value;
+        } elseif ($firstByte == 253) {
+            if ($offset + 3 > $payloadLength) return null;
+            $value = unpack('V', substr($payload, $offset, 3) . "\x00")[1];
+            $offset += 3;
+            return $value;
+        } elseif ($firstByte == 254) {
+            if ($offset + 8 > $payloadLength) return null;
+            $value = unpack('P', substr($payload, $offset, 8))[1];
+            $offset += 8;
+            return $value;
+        }
+
+        return null;
     }
 
     /**

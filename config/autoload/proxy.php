@@ -25,6 +25,7 @@ return [
     // 代理账号配置（客户端连接代理时使用的账号）
     'proxy_accounts' => [
         [
+            // mysql -h hyperf-sqlLogProxy -P 3309 -u proxy_user -pproxy_pass -e "SELECT 1;"
             'username' => 'proxy_user',
             'password' => 'proxy_pass', // 生产环境建议使用哈希存储
             'database' => '', // 允许连接的数据库，可为空表示不限制
@@ -39,7 +40,7 @@ return [
 
     // 后端真实MySQL账号配置（代理使用此账号连接真实MySQL）
     'backend_mysql' => [
-        'host' => env('TARGET_MYSQL_HOST', 'mysql57.common-all'),
+        'host' => env('TARGET_MYSQL_HOST', 'localhost'),
         'port' => (int) env('TARGET_MYSQL_PORT', 3306),
         'username' => env('TARGET_MYSQL_USERNAME', 'root'),
         'password' => env('TARGET_MYSQL_PASSWORD', 'root'),

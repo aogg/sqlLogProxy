@@ -195,7 +195,7 @@ class BackendExecutor
         }
 
         // EOF Packet after columns
-        $packets[] = Packet::create($sequenceId++, chr(0xfe)); // EOF
+        $packets[] = Packet::create($sequenceId++, $this->createEofPacket()); // EOF
 
         // Row Data Packets
         foreach ($result as $row) {
@@ -208,9 +208,19 @@ class BackendExecutor
         }
 
         // EOF Packet after rows
-        $packets[] = Packet::create($sequenceId++, chr(0xfe)); // EOF
+        $packets[] = Packet::create($sequenceId++, $this->createEofPacket()); // EOF
 
         return $packets;
+    }
+
+    /**
+     * 创建EOF包
+     */
+    private function createEofPacket(): string
+    {
+        // MySQL 5.7 EOF包格式：只包含EOF标记
+        // 在某些客户端实现中，EOF包只需要0xfe一个字节
+        return chr(0xfe);
     }
 
     /**
@@ -222,7 +232,7 @@ class BackendExecutor
         $packets = [Packet::create(0, $this->encodeLength(0))];
 
         // EOF
-        $packets[] = Packet::create(1, chr(0xfe));
+        $packets[] = Packet::create(1, $this->createEofPacket());
 
         return $packets;
     }
@@ -239,12 +249,13 @@ class BackendExecutor
         $payload .= $this->encodeLengthString(''); // org_table
         $payload .= $this->encodeLengthString($columnName); // name
         $payload .= $this->encodeLengthString($columnName); // org_name
-        $payload .= chr(0x0c); // length of fixed fields
-        $payload .= pack('v', 33); // charset (utf8mb4)
+        $payload .= chr(0x0c); // length of fixed fields (always 0x0c)
+        $payload .= pack('v', 33); // charset (utf8_general_ci = 33)
         $payload .= pack('V', 255); // max column length
-        $payload .= chr(0xfd); // type (VAR_STRING)
+        $payload .= chr(0xfd); // type (VAR_STRING = 0xfd)
         $payload .= pack('v', 0); // flags
         $payload .= chr(0); // decimals
+        $payload .= pack('v', 0); // filler (2 bytes, always 0x00 0x00)
 
         return $payload;
     }

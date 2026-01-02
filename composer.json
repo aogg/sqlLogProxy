@@ -13,6 +13,7 @@
     "license": "Apache-2.0",
     "require": {
         "php": ">=8.1",
+        "greenlion/php-sql-parser": "^4.7",
         "hyperf/cache": "~3.1.0",
         "hyperf/command": "^3.1",
         "hyperf/config": "~3.1.0",
@@ -47,7 +48,9 @@
         "psr-4": {
             "App\\": "app/"
         },
-        "files": []
+        "files": [
+            "app/Helpers/helpers.php"
+        ]
     },
     "autoload-dev": {
         "psr-4": {
@@ -66,7 +69,8 @@
             "@php -r \"file_exists('.env') || copy('.env.example', '.env');\""
         ],
         "post-autoload-dump": [
-            "rm -rf runtime/container"
+            "rm -rf runtime/container",
+            "rm -rf runtime/cache"
         ],
         "test": "co-phpunit --prepend test/bootstrap.php --colors=always",
         "cs-fix": "php-cs-fixer fix $1",

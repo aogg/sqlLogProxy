@@ -12,6 +12,8 @@ class Auth
     public const CAPABILITIES = 0x00aff7df;
     private const MAX_PACKET_SIZE = 0xffffff;
 
+    public static $OK = [7, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0];
+
     public static function generateAuthData(int $length = 20): string
     {
         $data = '';

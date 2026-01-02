@@ -10,6 +10,7 @@
 - ✅ **连接池**: 自动管理后端 MySQL 连接池，提高性能
 - ✅ **SQL 日志**: 完整的 SQL 执行日志记录
 - ✅ **协议兼容**: 支持基本的 MySQL 协议，包括查询、预处理语句等
+- ✅ **连接稳定性**: 自动连接恢复和超时处理，防止 "Lost connection" 错误
 
 ## 系统要求
 
@@ -157,6 +158,34 @@ MySQL 代理 (端口 3317)
 - **认证失败**: 确认代理账号配置正确
 - **后端连接失败**: 检查后端 MySQL 服务器可访问性
 - **连接池耗尽**: 调整 `pool.size` 配置
+- **"2013 - Lost connection to MySQL server during query" 错误**:
+
+  **可能原因**：
+  - 连接超时时间过短
+  - 查询执行时间过长
+  - 网络连接不稳定
+  - 连接池连接被意外关闭
+  - USE命令响应包格式不正确（缺少状态标志）
+
+  **解决方案**：
+  1. 检查并调整超时配置（已在最新版本中优化）
+  2. 修复USE命令响应包格式，添加SERVER_STATUS_AUTOCOMMIT标志
+  4. 监控连接池状态和系统资源
+  5. 调整MySQL服务器的超时参数
+  6. 重启代理服务以应用修复
+
+## 服务重启
+
+修改配置或代码后，需要重启代理服务：
+
+```bash
+# 如果使用Docker容器方式启动
+docker restart temp-hyperf-sqlLogProxy
+
+# 或者重新启动Hyperf服务
+php bin/hyperf.php stop
+php bin/hyperf.php start
+```
 
 ## 开发说明
 

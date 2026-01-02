@@ -10,6 +10,8 @@ class Packet
     private int $sequenceId;
     private string $payload;
 
+    public $toBytes;
+
     public function __construct(int $length, int $sequenceId, string $payload)
     {
         $this->length = $length;
@@ -47,6 +49,10 @@ class Packet
 
     public function toBytes(): string
     {
+        if ($this->toBytes) {
+            return $this->toBytes;
+        }
+
         $len = pack('V', $this->length);
         return substr($len, 0, 3) . chr($this->sequenceId) . $this->payload;
     }

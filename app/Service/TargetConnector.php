@@ -51,9 +51,10 @@ class TargetConnector
             $socket = new Socket(AF_INET, SOCK_STREAM, SOL_TCP);
             $socket->setProtocol([
                 'open_tcp_keepalive' => true,
-                'tcp_keepidle' => 60,
-                'tcp_keepinterval' => 30,
-                'tcp_keepcount' => 3,
+                'tcp_keepidle' => 60,      // 60秒后开始发送keep-alive
+                'tcp_keepinterval' => 30,  // 每30秒发送一次keep-alive
+                'tcp_keepcount' => 3,      // 3次失败后关闭连接
+                'tcp_user_timeout' => 60000, // 60秒用户超时
             ]);
 
             // Connect to target

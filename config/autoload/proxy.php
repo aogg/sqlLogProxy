@@ -26,8 +26,8 @@ return [
     'proxy_accounts' => [
         [
             // mysql -h hyperf-sqlLogProxy -P 3309 -u proxy_user -pproxy_pass -e "SELECT 1;"
-            'username' => 'proxy_user',
-            'password' => 'proxy_pass', // 生产环境建议使用哈希存储
+            'username' => env('PROXY_USERNAME', 'root'),
+            'password' => env('PROXY_PASSWORD', 'root'), // 生产环境建议使用哈希存储
             'database' => '', // 允许连接的数据库，可为空表示不限制
         ],
         // 可以添加更多代理账号
@@ -46,7 +46,9 @@ return [
         'password' => env('TARGET_MYSQL_PASSWORD', 'root'),
         'database' => env('TARGET_MYSQL_DATABASE', ''),
         'charset' => 'utf8mb4',
-        'connect_timeout' => 5.0,
+        'connect_timeout' => 15.0, // 连接超时时间，与MySQL服务器兼容
+        'read_timeout' => 120.0, // 读取超时，增加到2分钟
+        'write_timeout' => 120.0, // 写入超时，增加到2分钟
         'tls' => false, // 代理到真实MySQL的连接是否使用TLS
         'tls_ca_file' => null,
         'tls_cert_file' => null,

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Proxy\Executor;
 
+use App\Helpers\PHPSQLParserHelper;
 use Hyperf\DbConnection\Db;
 use App\Protocol\MySql\Packet;
 use App\Protocol\MySql\Parser;
@@ -17,6 +18,9 @@ use Psr\Log\LoggerInterface;
 class BackendExecutor
 {
     private LoggerInterface $logger;
+    private bool $hasRetried = false;
+    private int $maxRetries = 3; // 最大重试次数
+    private float $retryDelay = 0.1; // 重试延迟（秒）
 
     public function __construct(LoggerFactory $loggerFactory)
     {
@@ -28,22 +32,42 @@ class BackendExecutor
     /**
      * 执行 SQL 语句
      *
-     * @param string $sql 要执行的 SQL 语句
+     * @param PHPSQLParserHelper $sql 要执行的 SQL 语句
      * @param string|null $database 要使用的数据库名
      * @return array 执行结果，包含 MySQL 协议包
      */
-    public function execute(string $sql, ?string $database = null): array
+    public function execute(PHPSQLParserHelper $sql, ?string $database = null): array
     {
         $startTime = microtime(true);
+        $retryCount = 0;
 
         $this->logger->info('开始执行后端 SQL', [
             'sql' => $sql,
+            'max_retries' => $this->maxRetries,
         ]);
 
-        try {
-            // 使用 Hyperf 数据库连接执行 SQL
-            /** @var \Hyperf\DbConnection\Connection $connection */
-            $connection = DB::connection('backend_mysql');
+        while ($retryCount <= $this->maxRetries) {
+            try {
+                // 使用 Hyperf 数据库连接执行 SQL
+                /** @var \Hyperf\DbConnection\Connection $connection */
+                $connection = DB::connection('backend_mysql');
+
+                // 检查连接是否可用，如果不可用则重新连接
+                if (!$this->isConnectionValid($connection)) {
+                    $this->logger->warning('后端连接不可用，尝试重新连接', [
+                        'sql' => $sql,
+                        'retry_count' => $retryCount,
+                    ]);
+
+                    // 强制重新获取连接
+                    // 在 Hyperf 中，通过重新获取连接来处理连接问题
+                    $connection = DB::connection('backend_mysql');
+
+                    // 再次检查连接
+                    if (!$this->isConnectionValid($connection)) {
+                        throw new \RuntimeException('无法建立有效的数据库连接');
+                    }
+                }
 
             // 如果指定了数据库，先切换到该数据库
             if ($database !== null && $database !== '') {
@@ -55,8 +79,8 @@ class BackendExecutor
 
             // 对于 SELECT 查询，使用 select 方法
             // 支持前置注释（例如 MySQL Connector/J 会在前面带注释），所以使用正则去除注释后判断
-            if (preg_match('/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(select)\b/i', $sql) === 1) {
-                $result = $connection->select($sql);
+            if ($sql->isSelect()) {
+                $result = $connection->select($sql->sql);
                 // 某些 PDO 驱动或数据库层返回对象（stdClass），但下游期望关联数组
                 if (!empty($result)) {
                     $result = array_map(function ($row) {
@@ -94,7 +118,7 @@ class BackendExecutor
                 return $this->createResultSetPackets($result);
             } else {
                 // 对于其他查询（如 INSERT, UPDATE, DELETE），使用 statement 方法
-                $affectedRows = $connection->statement($sql);
+                $affectedRows = $connection->statement($sql->sql);
                 // 某些驱动 statement() 返回 bool 而非受影响行数，统一转换为 int
                 if (is_bool($affectedRows)) {
                     $affectedRows = $affectedRows ? 1 : 0;
@@ -114,21 +138,9 @@ class BackendExecutor
 
                 $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
 
-                // 识别SQL语句类型
-                $sqlType = 'UNKNOWN';
-                if (preg_match('/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(insert)\b/i', $sql)) {
-                    $sqlType = 'INSERT';
-                } elseif (preg_match('/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(update)\b/i', $sql)) {
-                    $sqlType = 'UPDATE';
-                } elseif (preg_match('/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(delete)\b/i', $sql)) {
-                    $sqlType = 'DELETE';
-                } elseif (preg_match('/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(create|alter|drop)\b/i', $sql)) {
-                    $sqlType = 'DDL';
-                }
 
-                $this->logger->info('后端查询执行成功', [
+                $this->logger->info('后端statement执行成功', [
                     'sql' => $sql,
-                    'sql_type' => $sqlType,
                     'elapsed_ms' => $elapsedMs,
                     'affected_rows' => $affectedRows,
                     'last_insert_id' => $lastInsertId,
@@ -137,21 +149,92 @@ class BackendExecutor
                 return $this->createOkPacket($affectedRows, $lastInsertId);
             }
 
-        } catch (\Throwable $e) {
-            $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
+            } catch (\Throwable $e) {
+                $elapsedMs = (int) ((microtime(true) - $startTime) * 1000);
+                $errorMessage = $e->getMessage();
 
-            $this->logger->error('后端执行器异常', [
-                'sql' => $sql,
-                'error' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine(),
-                'elapsed_ms' => $elapsedMs,
-            ]);
+                // 检查是否是连接相关错误且未达到最大重试次数
+                if ($this->isConnectionError($errorMessage) && $retryCount < $this->maxRetries) {
+                    $retryCount++;
+                    $this->logger->warning('检测到连接错误，准备重试', [
+                        'sql' => $sql,
+                        'error' => $errorMessage,
+                        'elapsed_ms' => $elapsedMs,
+                        'retry_count' => $retryCount,
+                        'max_retries' => $this->maxRetries,
+                    ]);
 
-            return $this->createErrorPackets(2000, 'Backend execution failed: ' . $e->getMessage());
+                    // 等待重试延迟
+                    if ($this->retryDelay > 0) {
+                        \Swoole\Coroutine\System::sleep($this->retryDelay * $retryCount); // 递增延迟
+                    }
+                    continue; // 继续下一次重试
+                }
+
+                // 达到最大重试次数或非连接错误，抛出异常
+                $this->logger->error('后端执行器异常', [
+                    'sql' => $sql,
+                    'error' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                    'elapsed_ms' => $elapsedMs,
+                    'retry_count' => $retryCount,
+                    'max_retries' => $this->maxRetries,
+                ]);
+
+                return $this->createErrorPackets(2000, 'Backend execution failed: ' . $e->getMessage());
+            }
         }
     }
 
+    /**
+     * 检查数据库连接是否有效
+     */
+    private function isConnectionValid($connection): bool
+    {
+        try {
+            // 使用更可靠的连接检查方法
+            // 1. 检查连接对象是否有效
+            if (!$connection) {
+                $this->logger->warning('连接对象无效');
+                return false;
+            }
+
+            // 2. 对于 Hyperf 连接，直接尝试执行查询来验证连接
+            // 使用 CONNECTION_ID() 来确保查询需要服务器响应，而不是从缓存返回
+            $result = $connection->select('SELECT CONNECTION_ID() as conn_id, NOW() as `current_time`');
+            if (empty($result)) {
+                $this->logger->warning('连接检查查询失败 - 无返回结果');
+                return false;
+            }
+
+            // 确保结果是数组格式
+            $firstRow = is_array($result) ? $result[0] : (array) $result[0];
+            // 如果仍然是对象，转换为数组
+            if (is_object($firstRow)) {
+                $firstRow = (array) $firstRow;
+            }
+            if (!isset($firstRow['conn_id'])) {
+                $this->logger->warning('连接检查查询失败 - 缺少 conn_id 字段');
+                return false;
+            }
+
+            $this->logger->debug('连接检查成功', [
+                'connection_id' => $firstRow['conn_id'],
+                'current_time' => $firstRow['current_time'] ?? null,
+            ]);
+
+            return true;
+        } catch (\Throwable $e) {
+            $this->logger->warning('连接检查失败', [
+                'error' => $e->getMessage(),
+                'error_code' => $e->getCode(),
+                'file' => basename($e->getFile()),
+                'line' => $e->getLine(),
+            ]);
+            return false;
+        }
+    }
 
     /**
      * 创建 OK 包
@@ -319,12 +402,34 @@ class BackendExecutor
             // 使用动态检测以兼容不同 DB 实现
             if (method_exists($connection, 'getPool')) {
                 $pool = $connection->getPool();
-                return [
+                $stats = [
                     'pool_type' => 'hyperf',
                     'pool_name' => 'backend_mysql',
                     'connections_count' => $pool->getConnectionsCount(),
                     'idle_connections_count' => $pool->getIdleConnectionsCount(),
                 ];
+
+                // 添加连接健康检查
+                $healthyConnections = 0;
+                $totalChecked = min($stats['connections_count'] ?? 0, 5); // 检查最多5个连接
+
+                for ($i = 0; $i < $totalChecked; $i++) {
+                    try {
+                        // 尝试获取一个连接并检查其有效性
+                        $testConnection = DB::connection('backend_mysql');
+                        if ($this->isConnectionValid($testConnection)) {
+                            $healthyConnections++;
+                        }
+                    } catch (\Throwable $e) {
+                        // 忽略检查过程中的异常
+                    }
+                }
+
+                $stats['healthy_connections'] = $healthyConnections;
+                $stats['health_check_sample_size'] = $totalChecked;
+                $stats['health_percentage'] = $totalChecked > 0 ? round(($healthyConnections / $totalChecked) * 100, 2) : 0;
+
+                return $stats;
             }
 
             // 如果没有 pool 支持，则返回基础信息
@@ -333,11 +438,53 @@ class BackendExecutor
                 'pool_name' => 'backend_mysql',
                 'connections_count' => null,
                 'idle_connections_count' => null,
+                'healthy_connections' => null,
+                'health_check_sample_size' => 0,
+                'health_percentage' => null,
             ];
         } catch (\Throwable $e) {
             return [
                 'error' => 'Failed to get pool stats: ' . $e->getMessage()
             ];
+        }
+    }
+
+    /**
+     * 强制重建连接池
+     * 用于在检测到大量连接问题时重建整个连接池
+     */
+    public function rebuildConnectionPool(): bool
+    {
+        try {
+            $this->logger->info('开始重建连接池');
+
+            // 清理现有连接池
+            // 在 Hyperf 中，通过连接管理器清理连接池
+            $container = \Hyperf\Context\ApplicationContext::getContainer();
+            if ($container->has(\Hyperf\DbConnection\ConnectionResolverInterface::class)) {
+                $resolver = $container->get(\Hyperf\DbConnection\ConnectionResolverInterface::class);
+                if (method_exists($resolver, 'purge')) {
+                    $resolver->purge('backend_mysql');
+                }
+            }
+
+            // 等待一小段时间让清理完成
+            \Swoole\Coroutine\System::sleep(0.1);
+
+            // 获取新连接并验证
+            $connection = DB::connection('backend_mysql');
+            $isValid = $this->isConnectionValid($connection);
+
+            $this->logger->info('连接池重建完成', [
+                'connection_valid' => $isValid,
+            ]);
+
+            return $isValid;
+        } catch (\Throwable $e) {
+            $this->logger->error('连接池重建失败', [
+                'error' => $e->getMessage(),
+            ]);
+            return false;
         }
     }
 
@@ -513,5 +660,30 @@ class BackendExecutor
         $payload .= pack('v', 0);             // warning_count (2 bytes)
 
         return [Packet::create(0, $payload)];
+    }
+
+    /**
+     * 检查是否是连接相关错误
+     */
+    private function isConnectionError(string $errorMessage): bool
+    {
+        $connectionErrors = [
+            'Lost connection',
+            'Connection refused',
+            'Connection timed out',
+            'Connection reset',
+            'Broken pipe',
+            'Network is unreachable',
+            'Connection aborted',
+            'MySQL server has gone away',
+        ];
+
+        foreach ($connectionErrors as $error) {
+            if (stripos($errorMessage, $error) !== false) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

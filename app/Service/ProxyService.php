@@ -368,21 +368,25 @@ class ProxyService
             $targetPort = $context->getTargetPort() !== null ? $context->getTargetPort() : 3306;
             $dsn = "host={$authResponse['username']};port={$targetPort};dbname={$authResponse['database']}";
 
+            $targetHost = $this->getBackendConfig()['host'];
+            $targetPort = $this->getBackendConfig()['port'];
+            $dsn = "host={$targetHost};port={$targetPort};dbname={$authResponse['database']}";
+
             $this->connectionLogger->debug('准备建立目标MySQL连接', [
                 'client_id' => $context->getClientId(),
                 'dsn' => $dsn,
-                'target_host' => $authResponse['username'],
+                'target_host' => $targetHost,
                 'target_port' => $targetPort,
                 'database' => $authResponse['database'],
             ]);
 
             // 建立到目标MySQL的连接
-            $mysqlSocket = $this->connectToTarget($authResponse['username'], $targetPort);
+            $mysqlSocket = $this->connectToTarget($this->getBackendConfig()['host'], $this->getBackendConfig()['port']);
 
             if (!$mysqlSocket) {
                 $this->connectionLogger->error('连接到目标MySQL失败', [
                     'client_id' => $context->getClientId(),
-                    'target_host' => $authResponse['username'],
+                    'target_host' => $targetHost,
                     'target_port' => $targetPort,
                 ]);
                 throw new \RuntimeException('Failed to connect to target MySQL');
@@ -398,7 +402,7 @@ class ProxyService
 
             $this->connectionLogger->info('MySQL连接建立成功', [
                 'client_id' => $context->getClientId(),
-                'target_host' => $authResponse['username'],
+                'target_host' => $targetHost,
                 'target_port' => $targetPort,
                 'database' => $authResponse['database'],
             ]);
@@ -749,95 +753,127 @@ class ProxyService
 
     private function forwardToTargetAndGetResponse(\Swoole\Server $server, ConnectionContext $context, Packet $packet): array
     {
-        $socket = $context->getMysqlSocket();
+        $maxRetries = 2; // 最大重试次数
+        $retryCount = 0;
 
-        if (!$socket) {
-            $this->connectionLogger->debug('MySQL连接不存在，尝试建立连接', [
-                'client_id' => $context->getClientId(),
-            ]);
-            $this->connectToTargetAndForward($server, $context, $packet);
-            return [];
+        while ($retryCount <= $maxRetries) {
+            try {
+                $socket = $context->getMysqlSocket();
+
+                if (!$socket) {
+                    $this->connectionLogger->debug('MySQL连接不存在，尝试建立连接', [
+                        'client_id' => $context->getClientId(),
+                        'retry_count' => $retryCount,
+                    ]);
+                    $this->connectToTargetAndForward($server, $context, $packet);
+                    return [];
+                }
+
+                // 使用锁来确保只有一个协程可以访问MySQL socket
+                $lock = $context->getSocketLock();
+                $lock->lock();
+
+                try {
+                    $packetData = $packet->toBytes();
+                    $this->connectionLogger->debug('转发SQL查询到目标MySQL', [
+                        'client_id' => $context->getClientId(),
+                        'data_length' => strlen($packetData),
+                        'command' => $packet->getCommand(),
+                        'data_hex' => bin2hex(substr($packetData, 0, 32)),
+                    ]);
+
+                    $sendResult = $socket->sendAll($packetData);
+
+                    $this->connectionLogger->debug('SQL查询发送完成', [
+                        'client_id' => $context->getClientId(),
+                        'sent_bytes' => $sendResult,
+                    ]);
+
+                    $this->mysqlSendLogger->info('发送SQL查询到MySQL', [
+                        'client_id' => $context->getClientId(),
+                        'command' => $packet->getCommand(),
+                        'sequence_id' => $packet->getSequenceId(),
+                        'data_length' => strlen($packetData),
+                        'data_hex' => bin2hex($packetData),
+                        'data_ascii' => $this->toAscii($packetData),
+                    ]);
+
+                    $responseData = $this->readAllPackets($socket);
+
+                    $this->connectionLogger->debug('开始解析MySQL响应', [
+                        'client_id' => $context->getClientId(),
+                        'response_data_length' => strlen($responseData),
+                    ]);
+
+                    $packets = Parser::parsePackets($responseData);
+
+                    $this->connectionLogger->debug('MySQL响应解析完成', [
+                        'client_id' => $context->getClientId(),
+                        'packet_count' => count($packets),
+                    ]);
+
+                    // 检查MySQL返回的响应是否是错误包
+                    if (!empty($packets) && Response::isErrorPacket($packets[0])) {
+                        $errorData = Response::parseErrorPacket($packets[0]);
+                        $this->connectionLogger->error('MySQL查询错误', [
+                            'client_id' => $context->getClientId(),
+                            'error_code' => $errorData['error_code'],
+                            'sql_state' => $errorData['sql_state'],
+                            'error_message' => $errorData['error_message'],
+                        ]);
+                    }
+
+                    if ($responseData !== '') {
+                        // 直接转发MySQL响应（保持原始sequence_id）
+                        $server->send((int) $context->getClientId(), $responseData);
+
+                        $this->connectionLogger->debug('已转发MySQL响应', [
+                            'client_id' => $context->getClientId(),
+                            'response_length' => strlen($responseData),
+                            'packet_count' => count($packets),
+                        ]);
+                    } else {
+                        $this->connectionLogger->warning('sql代理: MySQL响应为空', [
+                            'client_id' => $context->getClientId(),
+                        ]);
+                    }
+
+                    return $packets;
+                } finally {
+                    $lock->unlock();
+                }
+            } catch (\RuntimeException $e) {
+                if (str_contains($e->getMessage(), 'Lost connection to MySQL server') && $retryCount < $maxRetries) {
+                    $this->connectionLogger->warning('MySQL连接丢失，尝试重连', [
+                        'client_id' => $context->getClientId(),
+                        'retry_count' => $retryCount + 1,
+                        'max_retries' => $maxRetries,
+                        'error' => $e->getMessage(),
+                    ]);
+
+                    // 关闭当前连接
+                    if ($context->getMysqlSocket()) {
+                        $context->getMysqlSocket()->close();
+                        $context->setMysqlSocket(null);
+                    }
+
+                    $retryCount++;
+                    \Swoole\Coroutine::sleep(0.1 * $retryCount); // 递增延迟重试
+                    continue;
+                }
+
+                throw $e;
+            }
         }
 
-        // 使用锁来确保只有一个协程可以访问MySQL socket
-        $lock = $context->getSocketLock();
-        $lock->lock();
-
-        try {
-            $packetData = $packet->toBytes();
-            $this->connectionLogger->debug('转发SQL查询到目标MySQL', [
-                'client_id' => $context->getClientId(),
-                'data_length' => strlen($packetData),
-                'command' => $packet->getCommand(),
-                'data_hex' => bin2hex(substr($packetData, 0, 32)),
-            ]);
-
-            $sendResult = $socket->sendAll($packetData);
-
-            $this->connectionLogger->debug('SQL查询发送完成', [
-                'client_id' => $context->getClientId(),
-                'sent_bytes' => $sendResult,
-            ]);
-
-            $this->mysqlSendLogger->info('发送SQL查询到MySQL', [
-                'client_id' => $context->getClientId(),
-                'command' => $packet->getCommand(),
-                'sequence_id' => $packet->getSequenceId(),
-                'data_length' => strlen($packetData),
-                'data_hex' => bin2hex($packetData),
-                'data_ascii' => $this->toAscii($packetData),
-            ]);
-
-            $responseData = $this->readAllPackets($socket);
-
-            $this->connectionLogger->debug('开始解析MySQL响应', [
-                'client_id' => $context->getClientId(),
-                'response_data_length' => strlen($responseData),
-            ]);
-
-            $packets = Parser::parsePackets($responseData);
-
-            $this->connectionLogger->debug('MySQL响应解析完成', [
-                'client_id' => $context->getClientId(),
-                'packet_count' => count($packets),
-            ]);
-
-            // 检查MySQL返回的响应是否是错误包
-            if (!empty($packets) && Response::isErrorPacket($packets[0])) {
-                $errorData = Response::parseErrorPacket($packets[0]);
-                $this->connectionLogger->error('MySQL查询错误', [
-                    'client_id' => $context->getClientId(),
-                    'error_code' => $errorData['error_code'],
-                    'sql_state' => $errorData['sql_state'],
-                    'error_message' => $errorData['error_message'],
-                ]);
-            }
-
-            if ($responseData !== '') {
-                // 直接转发MySQL响应（保持原始sequence_id）
-                $server->send((int) $context->getClientId(), $responseData);
-
-                $this->connectionLogger->debug('已转发MySQL响应', [
-                    'client_id' => $context->getClientId(),
-                    'response_length' => strlen($responseData),
-                    'packet_count' => count($packets),
-                ]);
-            } else {
-                $this->connectionLogger->warning('sql代理: MySQL响应为空', [
-                    'client_id' => $context->getClientId(),
-                ]);
-            }
-
-            return $packets;
-        } finally {
-            $lock->unlock();
-        }
+        // 如果所有重试都失败，抛出异常
+        throw new \RuntimeException('Failed to execute query after ' . $maxRetries . ' retries');
     }
 
     private function readAllPackets(Socket $socket): string
     {
         $buffer = '';
-        $timeout = 2.0; // 超时时间
+        $timeout = 30.0; // 增加超时时间到30秒，避免查询超时
 
         $this->connectionLogger->debug('开始读取第一个数据包头', [
             'timeout' => $timeout,
@@ -850,7 +886,14 @@ class ProxyService
                 'expected_length' => 4,
                 'actual_length' => $header === false ? 'false' : strlen($header),
                 'timeout' => $timeout,
+                'error_message' => $header === false ? 'Connection lost or timeout' : 'Incomplete header',
             ]);
+
+            // 如果是连接丢失，抛出异常让上层处理
+            if ($header === false) {
+                throw new \RuntimeException('Lost connection to MySQL server during query');
+            }
+
             return $buffer;
         }
 
@@ -1234,5 +1277,69 @@ class ProxyService
         }
 
         return $result;
+    }
+
+    /**
+     * 获取后端MySQL配置
+     */
+    private function getBackendConfig(): array
+    {
+        $config = config('proxy.backend_mysql', []);
+        return [
+            'host' => $config['host'] ?? 'mysql57.common-all',
+            'port' => $config['port'] ?? 3306,
+            'username' => $config['username'] ?? 'root',
+            'password' => $config['password'] ?? 'root',
+            'database' => $config['database'] ?? '',
+            'charset' => $config['charset'] ?? 'utf8mb4',
+            'connect_timeout' => $config['connect_timeout'] ?? 15.0,
+            'read_timeout' => $config['read_timeout'] ?? 120.0,
+            'write_timeout' => $config['write_timeout'] ?? 120.0,
+            'tls' => $config['tls'] ?? false,
+        ];
+    }
+
+    /**
+     * 连接到目标MySQL服务器
+     */
+    private function connectToTarget(string $host, int $port): ?Socket
+    {
+        try {
+            $this->connectionLogger->info('开始连接到目标MySQL', [
+                'host' => $host,
+                'port' => $port,
+            ]);
+
+            $connector = new TargetConnector(
+                $host,
+                $port,
+                5.0, // 连接超时
+                false // 不使用TLS
+            );
+
+            $socket = $connector->connect();
+
+            if ($socket) {
+                $this->connectionLogger->info('成功连接到目标MySQL', [
+                    'host' => $host,
+                    'port' => $port,
+                ]);
+            } else {
+                $this->connectionLogger->error('连接到目标MySQL失败', [
+                    'host' => $host,
+                    'port' => $port,
+                ]);
+            }
+
+            return $socket;
+
+        } catch (\Exception $e) {
+            $this->connectionLogger->error('连接目标MySQL时发生异常', [
+                'host' => $host,
+                'port' => $port,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
     }
 }

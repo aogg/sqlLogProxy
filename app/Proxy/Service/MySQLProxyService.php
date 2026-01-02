@@ -83,6 +83,10 @@ class MySQLProxyService
 
     /**
      * 处理客户端数据包
+     *
+     * @param ConnectionContext $context 连接上下文
+     * @param Packet $packet 数据包
+     * @return Packet[]
      */
     public function handlePacket(ConnectionContext $context, Packet $packet): ?array
     {
@@ -300,7 +304,13 @@ class MySQLProxyService
             $this->logger->debug('处理命令', [
                 'client_id' => $context->getClientId(),
                 'command_type' => $parsedCommand['type'],
+                'parsedCommand' => $parsedCommand,
             ]);
+
+            // 处理sql
+            if (!empty($parsedCommand['sql'])) {
+                $parsedCommand['sql'] = (new \App\Helpers\PHPSQLParserHelper($parsedCommand['sql']));
+            }
 
             switch ($parsedCommand['type']) {
                 case 'query':
@@ -343,17 +353,17 @@ class MySQLProxyService
     /**
      * 处理查询命令
      */
-    private function handleQuery(ConnectionContext $context, string $sql): array
+    private function handleQuery(ConnectionContext $context, \App\Helpers\PHPSQLParserHelper $sql): array
     {
         // 从查询中检测客户端类型（如果还没检测到）
-        $this->clientDetector->detectFromQuery($context, $sql);
+        $this->clientDetector->detectFromQuery($context, $sql->sql);
 
-        $this->logger->info('执行 SQL 查询', [
+        $this->logger->info('handleQuery 执行 SQL 查询', [
             'client_id' => $context->getClientId(),
             'username' => $context->getUsername(),
             'client_type' => $context->getClientType()->value,
             'client_version' => $context->getClientVersion(),
-            'sql' => $sql,
+            'sql' => $sql->sql,
         ]);
 
         // 使用后端执行器执行 SQL
@@ -368,7 +378,7 @@ class MySQLProxyService
         }
 
         // 记录所有返回的数据包
-        $this->logger->info('准备返回数据包给客户端', [
+        $this->logger->info('handleQuery 准备返回数据包给客户端', [
             'client_id' => $context->getClientId(),
             'packet_count' => count($adjustedPackets),
             'packets_info' => array_map(function($packet) {
@@ -438,23 +448,44 @@ class MySQLProxyService
             'new_database' => $database,
         ]);
 
-        // 设置新的数据库
-        $context->setDatabase($database);
+        try {
+            // 设置新的数据库
+            $context->setDatabase($database);
 
-        $this->logger->info('数据库切换成功', [
-            'client_id' => $context->getClientId(),
-            'username' => $context->getUsername(),
-            'current_database' => $context->getDatabase(),
-        ]);
+            $this->logger->info('数据库切换成功', [
+                'client_id' => $context->getClientId(),
+                'username' => $context->getUsername(),
+                'current_database' => $context->getDatabase(),
+            ]);
 
-        // 返回 OK 包表示切换成功
-        return [Auth::createOkPacket()];
+            // 创建OK包，包含正确的状态标志
+            $okPacket = Auth::createOkPacket(0, 0, 0x0002, 0); // SERVER_STATUS_AUTOCOMMIT
+            $okPacket->toBytes = bytes_to_string(Auth::$OK);
+
+            $this->logger->debug('USE命令响应包详情', [
+                'client_id' => $context->getClientId(),
+                'packet_sequence_id' => $okPacket->getSequenceId(),
+                'packet_payload_length' => strlen($okPacket->getPayload()),
+                'packet_payload_hex' => bin2hex($okPacket->getPayload()),
+                'status_flags' => '0x0002 (SERVER_STATUS_AUTOCOMMIT)',
+            ]);
+
+            return [$okPacket];
+        } catch (\Exception $e) {
+            $this->logger->error('USE命令处理异常', [
+                'client_id' => $context->getClientId(),
+                'database' => $database,
+                'error' => $e->getMessage(),
+            ]);
+
+            return $this->createErrorPackets('Failed to switch database: ' . $e->getMessage());
+        }
     }
 
     /**
      * 处理预编译语句准备命令
      */
-    private function handlePrepare(ConnectionContext $context, string $sql): array
+    private function handlePrepare(ConnectionContext $context, \App\Helpers\PHPSQLParserHelper $sql): array
     {
         $this->logger->info('收到预处理语句准备请求', [
             'client_id' => $context->getClientId(),
@@ -463,7 +494,7 @@ class MySQLProxyService
         ]);
 
         // 转发到后端执行
-        $packets = $this->executor->executePrepare($sql, $context->getDatabase());
+        $packets = $this->executor->executePrepare($sql->sql, $context->getDatabase());
 
         // 注册预处理语句
         if (!empty($packets)) {
@@ -471,7 +502,7 @@ class MySQLProxyService
             $stmtId = $prepareResp['statement_id'];
             $numParams = $prepareResp['num_params'];
 
-            Parser::registerPreparedStatement($stmtId, $sql);
+            Parser::registerPreparedStatement($stmtId, $sql->sql);
             Parser::setPreparedStatementParamCount($stmtId, $numParams);
 
             $this->logger->debug('预处理语句注册成功', [

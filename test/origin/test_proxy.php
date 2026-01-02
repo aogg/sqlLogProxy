@@ -11,8 +11,8 @@ $pdo = null;
 // 测试1: 连接到代理
 echo "测试1: 连接到代理服务（使用 proxy_user 账号）...\n";
 try {
-    $dsn = "mysql:host=127.0.0.1;port=3307";
-    $pdo = new PDO($dsn, "proxy_user", "");
+    $dsn = "mysql:host=127.0.0.1;port=3308";
+    $pdo = new PDO($dsn, "proxy_user", "proxy_pass");
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     echo "✅ 通过代理连接成功！\n\n";
 } catch (PDOException $e) {

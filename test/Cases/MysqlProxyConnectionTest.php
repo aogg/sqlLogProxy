@@ -6,7 +6,6 @@ namespace HyperfTest\Cases;
 
 use Hyperf\Context\ApplicationContext;
 use Hyperf\DbConnection\Db;
-use HyperfTest\TestCase;
 use PHPUnit\Framework\Assert;
 use Swoole\Coroutine;
 use Swoole\Process;
@@ -15,7 +14,7 @@ use Swoole\Process;
  * MySQL代理连接测试
  * 验证通过代理服务连接到MySQL容器并执行查询
  */
-class MysqlProxyConnectionTest extends TestCase
+class MysqlProxyConnectionTest extends \PHPUnit\Framework\TestCase
 {
     // 代理服务器进程
     private ?Process $proxyProcess = null;

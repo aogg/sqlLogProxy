@@ -1,0 +1,77 @@
+---
+description: 根据日志增加测试方法
+alwaysApply: false
+enabled: true
+updatedAt: 2026-01-03T01:51:03.249Z
+provider:
+---
+
+# 增加测试方法规则
+
+## 输入
+用户提供以下3个文件：
+1. 当前 mdc 规则文件
+2. 包含需要新增测试的方法源文件（提取完整方法实现）
+3. 一段文案（测试数据和日志信息）
+
+## 工作流程
+
+### 1. 分析方法实现
+- 读取源文件，获取方法的完整实现
+- 理解方法的逻辑流程和依赖关系
+- 识别需要 mock 的对象（如Logger、Socket、ConnectionContext等）
+
+### 2. 查看现有测试结构
+- 检查 `test/Cases/` 目录下的测试文件命名规范
+- 读取现有测试文件，了解测试框架使用模式（基于 hyperf/test）
+- 了解项目特有的测试辅助方法和 setup 模式
+
+### 3. 编写测试方法
+- 在相应的测试文件中添加新的测试方法
+- 测试方法命名：`test` + 场景描述（驼峰命名）
+- 按照现有测试文件的代码风格编写
+- 使用适当的 mock 对象和断言
+
+### 4. 关键点
+- **Logger mock**：Psr\Log\LoggerInterface 的方法返回 void，不能使用 `willReturn(null)`，只需 `method('info')` 即可
+
+### 5. 输出
+- 直接修改测试文件，不使用 create_rule 或 write_to_file 创建新文件
+- 使用 replace_in_file 工具在现有测试文件中添加新方法
+- 只输出测试方法代码，不需要输出其他解释
+
+## 示例
+
+### 文案示例
+```
+public function onReceive(\Swoole\Server $server, int $fd, int $reactorId, string $data): void
+给这个方法增加单元测试，基于hyperf/test，写好不用你自测，只写这个方法的单元测试
+只写上面json里的data作为方法里的data参数
+```
+
+### 日志示例
+```
+[2026-01-03 01:17:19] onReceive.DEBUG: 收到客户端数据 {"data":"XAAAAQ+iLgD///8ALQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcm9vdAAUPIEOYS0ZcLC1NyzXvXedxu+3qStxaW1hbFxfcGx1cwBteXNxbF9uYXRpdmVfcGFzc3dvcmQA","fd":1,"reactor_id":0,"pid":401}
+```
+
+### 代码模板
+```php
+    public function testReceiveWithActualAuthResponseData()
+    {
+        $server = $this->createMock(Server::class);
+        $fd = 1;  // 从日志提取
+        $reactorId = 0;  // 从日志提取
+        
+        // 解码 Base64 数据
+        $authResponseBase64 = 'XAAAAQ+iLgD///8ALQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcm9vdAAUPIEOYS0ZcLC1NyzXvXedxu+3qStxaW1hbFxfcGx1cwBteXNxbF9uYXRpdmVfcGFzc3dvcmQA';
+        $authResponseData = base64_decode($authResponseBase64);
+        
+        // 创建连接上下文
+        $context = $this->addConnectionContext($fd, $server);
+        
+        // Mock 各种对象...
+        
+        // 调用方法
+        $this->proxyService->onReceive($server, $fd, $reactorId, $authResponseData);
+    }
+```

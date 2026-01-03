@@ -23,6 +23,11 @@ use App\Proxy\Auth\ProxyAuthenticator;
 use App\Proxy\Executor\BackendExecutor;
 use function Hyperf\Config\config;
 
+/**
+ * 代理服务
+ *
+ * @deprecated 请使用 MySQLProxyService
+ */
 class ProxyService
 {
     private ContainerInterface $container;
@@ -238,7 +243,7 @@ class ProxyService
                 $socket = $server->getClientInfo((int) $clientId);
                 if ($socket && isset($socket['socket_fd'])) {
                     // 获取原始socket并启用SSL
-                    $swooleSocket = new Swoole\Coroutine\Socket($socket['socket_fd']);
+                    $swooleSocket = new \Swoole\Coroutine\Socket($socket['socket_fd']);
                     $sslResult = $swooleSocket->enableSSL([
                         'ssl_cert_file' => BASE_PATH . '/runtime/certs/server.crt',
                         'ssl_key_file' => BASE_PATH . '/runtime/certs/server.key',

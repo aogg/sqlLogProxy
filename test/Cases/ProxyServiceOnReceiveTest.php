@@ -211,6 +211,78 @@ class ProxyServiceOnReceiveTest extends TestCase
     }
 
     /**
+     * 测试：收到实际的客户端认证响应数据（Base64: XAAAAQ+iLgD///8ALQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcm9vdAAUPIEOYS0ZcLC1NyzXvXedxu+3qStxaW1hbFxfcGx1cwBteXNxbF9uYXRpdmVfcGFzc3dvcmQA）
+     */
+    public function testReceiveWithActualAuthResponseData()
+    {
+        $server = $this->createMock(Server::class);
+        $fd = 1;  // 日志中的 fd 是 1
+        $reactorId = 0;  // 日志中的 reactor_id 是 0
+
+        // 解码 Base64 数据（从日志中的 data 字段）
+        $authResponseBase64 = 'XAAAAQ+iLgD///8ALQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcm9vdAAUPIEOYS0ZcLC1NyzXvXedxu+3qStxaW1hbFxfcGx1cwBteXNxbF9uYXRpdmVfcGFzc3dvcmQA';
+        $authResponseData = base64_decode($authResponseBase64);
+
+        // 验证数据解码成功
+        $this->assertNotFalse($authResponseData, 'Base64 数据解码失败');
+        $this->assertGreaterThan(0, strlen($authResponseData), '解码后的数据不应为空');
+
+        // 创建连接上下文并添加到服务（但没有 MySQL socket，因为这是首次认证）
+        $context = $this->addConnectionContext($fd, $server);
+
+        // 创建 MySQL socket mock
+        $mysqlSocket = $this->createMock(
+            \Swoole\Coroutine\Socket::class
+        );
+
+        // 设置 socket 期望
+        // sendAll 应该被调用，用于发送认证数据到目标 MySQL
+        $mysqlSocket->expects($this->once())
+            ->method('sendAll')
+            ->with($this->callback(function ($data) {
+                // 验证发送的数据长度合理
+                return strlen($data) > 20;
+            }))
+            ->willReturn(strlen($authResponseData));
+
+        // recvAll 应该被调用，用于读取 MySQL 的认证响应
+        $mysqlSocket->expects($this->once())
+            ->method('recvAll')
+            ->willReturn($this->createOkPacket());
+
+        // 设置 server 期望
+        // server->send 应该被调用，用于将 MySQL 的响应转发给客户端
+        $server->expects($this->once())
+            ->method('send')
+            ->with($fd, $this->callback(function ($data) {
+                // 验证返回的是有效的 MySQL 响应包
+                return strlen($data) >= 4;
+            }))
+            ->willReturn(true);
+
+        // 设置 connection logger 期望
+        $this->connectionLoggerMock->expects($this->atLeastOnce())
+            ->method('info')
+            ->with(
+                $this->logicalOr(
+                    '=== onReceive 被调用 ===',
+                    '收到客户端数据',
+                    '检测到客户端认证响应，准备连接目标MySQL',
+                    '解析客户端认证信息成功',
+                    'MySQL连接建立成功',
+                    '认证响应已转发'
+                ),
+                $this->anything()
+            );
+
+        // 调用 onReceive - 这将触发认证流程
+        $this->proxyService->onReceive($server, $fd, $reactorId, $authResponseData);
+
+        $this->assertTrue(true, '实际认证响应数据处理成功');
+    }
+
+
+    /**
      * 测试：收到 COM_QUERY 命令
      */
     public function testReceiveWithQueryCommand()
@@ -538,7 +610,7 @@ class ProxyServiceOnReceiveTest extends TestCase
         $connectionsProperty = $reflection->getProperty('connections');
         $connectionsProperty->setAccessible(true);
 
-        $context = new ConnectionContext($fd, '127.0.0.1', 3306);
+        $context = new ConnectionContext($fd, '127.0.0.1', 3309);
         $connectionsProperty->setValue($this->proxyService, [(string)$fd => $context]);
 
         return $context;

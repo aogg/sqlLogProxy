@@ -32,7 +32,24 @@ return [
             'class' => Monolog\Handler\StreamHandler::class,
             'constructor' => [
                 'stream' => BASE_PATH . '/runtime/logs/proxy.log',
-                'level' => Monolog\Logger::DEBUG,
+                'level' => \Monolog\Level::Debug,
+            ],
+        ],
+        'formatter' => [
+            'class' => Monolog\Formatter\LineFormatter::class,
+            'constructor' => [
+                'format' => null,
+                'dateFormat' => 'Y-m-d H:i:s',
+                'allowInlineLineBreaks' => true,
+            ],
+        ],
+    ],
+    \App\Enums\LogEnum::base64DataByClientSendProxy->value => [
+        'handler' => [
+            'class' => Monolog\Handler\StreamHandler::class,
+            'constructor' => [
+                'stream' => BASE_PATH . '/runtime/logs/base64_data_by_client_send_proxy.log',
+                'level' => \Monolog\Level::Debug,
             ],
         ],
         'formatter' => [

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Proxy\Service;
 
+use App\Enums\LogEnum;
 use App\Protocol\MySql\Packet;
 use App\Protocol\MySql\Parser;
 use App\Protocol\MySql\Auth;
@@ -710,6 +711,12 @@ class MySQLProxyService
             'fd' => $fd,
             'reactor_id' => $reactorId,
             'data_length' => strlen($data),
+            'pid' => getmypid(),
+        ]);
+        LogEnum::base64DataByClientSendProxy->getLogger('onReceive')->debug('收到客户端数据', [
+            'data' => base64_encode($data),
+            'fd' => $fd,
+            'reactor_id' => $reactorId,
             'pid' => getmypid(),
         ]);
 

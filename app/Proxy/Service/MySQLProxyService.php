@@ -16,6 +16,7 @@ use App\Proxy\Auth\ProxyAuthenticator;
 use App\Proxy\Executor\BackendExecutor;
 use App\Proxy\Client\ClientDetector;
 use App\Proxy\Client\ProtocolAdapter;
+use Hyperf\Di\Annotation\Inject;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
 use Swoole\Coroutine\Socket;
@@ -28,24 +29,38 @@ use function Hyperf\Config\config;
 class MySQLProxyService
 {
     private LoggerInterface $logger;
+
+    #[Inject]
     private MySQLHandshake $handshake;
+
+    /**
+     * @var ProxyAuthenticator $authenticator 认证器
+     */
+    #[Inject]
     private ProxyAuthenticator $authenticator;
+
     private BackendExecutor $executor;
+
+    /**
+     * @var ClientDetector $clientDetector 客户端检测器
+     */
     private ClientDetector $clientDetector;
     private ProtocolAdapter $protocolAdapter;
+
+    /**
+     * 连接池
+     *
+     * @var ConnectionContext[] $connections
+     */
     private array $connections = [];
 
     public function __construct(
         LoggerFactory $loggerFactory,
-        MySQLHandshake $handshake,
-        ProxyAuthenticator $authenticator,
         BackendExecutor $executor,
         ClientDetector $clientDetector,
         ProtocolAdapter $protocolAdapter
     ) {
         $this->logger = $loggerFactory->get('proxy_service');
-        $this->handshake = $handshake;
-        $this->authenticator = $authenticator;
         $this->executor = $executor;
         $this->clientDetector = $clientDetector;
         $this->protocolAdapter = $protocolAdapter;
@@ -673,6 +688,11 @@ class MySQLProxyService
         $authPluginData = $this->handshake->generateAuthPluginData(21);
         $context->setAuthPluginData($authPluginData);
 
+        LogEnum::base64DataByClientSendProxy->getLogger('onConnect')->debug('创建连接上下文', [
+            'client_id' => $clientId,
+            'auth_plugin_data' => base64_encode($authPluginData),
+        ]);
+
         $this->connections[$clientId] = $context;
 
         // 立即发送服务器握手包
@@ -713,15 +733,18 @@ class MySQLProxyService
             'data_length' => strlen($data),
             'pid' => getmypid(),
         ]);
+
+        $clientId = (string) $fd;
+        $context = isset($this->connections[$clientId]) ? $this->connections[$clientId] : null;
+
         LogEnum::base64DataByClientSendProxy->getLogger('onReceive')->debug('收到客户端数据', [
             'data' => base64_encode($data),
+            'getAuthPluginData' => $context ? base64_encode($context->getAuthPluginData()) : null,
+            '$context' => serialize($context),
             'fd' => $fd,
             'reactor_id' => $reactorId,
             'pid' => getmypid(),
         ]);
-
-        $clientId = (string) $fd;
-        $context = isset($this->connections[$clientId]) ? $this->connections[$clientId] : null;
 
         if (!$context) {
             $this->logger->warning('收到未知客户端的数据', [

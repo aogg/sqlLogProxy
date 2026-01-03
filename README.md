@@ -21,12 +21,6 @@
 
 ## 快速开始
 
-### 1. 环境检查
-
-```bash
-# 检查 Swoole SSL 支持和其他环境要求
-php test/check_swoole_ssl.php
-```
 
 ### 2. 配置 SSL 证书
 
@@ -45,8 +39,8 @@ openssl req -x509 -newkey rsa:4096 -keyout runtime/certs/server.key -out runtime
 ```php
 'proxy_accounts' => [
     [
-        'username' => 'proxy_user',
-        'password' => 'proxy_pass',
+        'username' => 'root',
+        'password' => 'root',
         'database' => '', // 空表示不限制数据库
     ],
 ],
@@ -72,25 +66,6 @@ mysql --ssl-mode=REQUIRED -h 127.0.0.1 -P 3317 -u proxy_user -p proxy_pass
 ```
 
 ## 配置说明
-
-### 代理账号配置
-
-在 `config/autoload/proxy.php` 中配置允许连接代理的账号：
-
-```php
-'proxy_accounts' => [
-    [
-        'username' => 'app_user',
-        'password' => 'secure_password',
-        'database' => 'app_db', // 可选，限制可访问的数据库
-    ],
-    [
-        'username' => 'admin',
-        'password' => 'admin_pass',
-        'database' => '', // 空字符串表示可访问任何数据库
-    ],
-],
-```
 
 ### 后端 MySQL 配置
 

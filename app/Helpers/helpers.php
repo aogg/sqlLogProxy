@@ -16,7 +16,7 @@ function copy_directory(string $source, string $destination): bool {
 
     // 创建目标目录（如果不存在）
     if (!is_dir($destination)) {
-        return false;
+        mkdir($destination, 0755, true);
     }
 
     // 打开目录句柄

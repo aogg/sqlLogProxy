@@ -39,6 +39,7 @@ provider:
 - 直接修改测试文件，不使用 create_rule 或 write_to_file 创建新文件
 - 使用 replace_in_file 工具在现有测试文件中添加新方法
 - 只输出测试方法代码，不需要输出其他解释
+- 也不需要自测，只给代码
 
 ## 示例
 

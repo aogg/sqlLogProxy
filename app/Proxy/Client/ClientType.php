@@ -26,4 +26,14 @@ enum ClientType: string
             self::UNKNOWN => '未知客户端',
         };
     }
+
+    public function checkAuth($storedPassword, $authPluginData)
+    {
+        return match ($this) {
+            self::JAVA_CONNECTOR => \App\Helpers\Mysql\SecurityHelper::scramble411_new($storedPassword, $authPluginData),
+            self::PHP_PDO => \App\Helpers\Mysql\SecurityHelper::calculateAuthResponse($storedPassword, $authPluginData),
+            self::MYSQL_CLIENT => \App\Helpers\Mysql\SecurityHelper::calculateAuthResponse($storedPassword, $authPluginData),
+            self::UNKNOWN => false,
+        };
+    }
 }

@@ -116,7 +116,7 @@ class MySQLHandshake
         if ($offset + 4 > $payloadLength) {
             throw new \RuntimeException('解析客户端握手响应失败：数据包长度不足，无法读取 Capability Flags');
         }
-        $capabilities = unpack('V', substr($payload, $offset, 4))[1];
+        $capabilities = $packet->getCapabilities();
         $offset += 4;
 
         // 检查客户端是否请求 SSL
@@ -137,7 +137,7 @@ class MySQLHandshake
         if ($clientRequestsSsl && $packet->getSequenceId() === 1) {
             // 即使是SSL请求，也尝试检测客户端类型
             if ($context && $clientDetector) {
-                $clientDetector->detectFromHandshake($context, [
+                $clientDetector->detectFromHandshake($packet, $context, [
                     'capabilities' => $capabilities,
                     'charset' => 0, // SSL请求阶段还没有字符集信息
                 ]);
@@ -155,7 +155,7 @@ class MySQLHandshake
 
         // 如果提供了上下文和检测器，进行客户端类型检测
         if ($context && $clientDetector && isset($authData['capabilities'])) {
-            $clientDetector->detectFromHandshake($context, [
+            $clientDetector->detectFromHandshake($packet, $context, [
                 'capabilities' => $authData['capabilities'],
                 'charset' => $authData['charset'] ?? 0,
             ]);
@@ -166,35 +166,53 @@ class MySQLHandshake
 
     /**
      * 详细记录客户端能力标志
+     *
+     * MySQL 客户端能力标志位掩码定义，每个标志位代表客户端支持的特定功能
+     * 按功能类别分组，便于理解和维护
      */
     private function logClientCapabilities(int $capabilities): void
     {
         $capabilityDetails = [
-            'CLIENT_LONG_PASSWORD' => ($capabilities & 0x00000001) !== 0,
-            'CLIENT_FOUND_ROWS' => ($capabilities & 0x00000002) !== 0,
-            'CLIENT_LONG_FLAG' => ($capabilities & 0x00000004) !== 0,
-            'CLIENT_CONNECT_WITH_DB' => ($capabilities & 0x00000008) !== 0,
-            'CLIENT_NO_SCHEMA' => ($capabilities & 0x00000010) !== 0,
-            'CLIENT_COMPRESS' => ($capabilities & 0x00000020) !== 0,
-            'CLIENT_ODBC' => ($capabilities & 0x00000040) !== 0,
-            'CLIENT_LOCAL_FILES' => ($capabilities & 0x00000080) !== 0,
-            'CLIENT_IGNORE_SPACE' => ($capabilities & 0x00000100) !== 0,
-            'CLIENT_PROTOCOL_41' => ($capabilities & 0x00000200) !== 0,
-            'CLIENT_INTERACTIVE' => ($capabilities & 0x00000400) !== 0,
-            'CLIENT_SSL' => ($capabilities & 0x00000800) !== 0,
-            'CLIENT_IGNORE_SIGPIPE' => ($capabilities & 0x00001000) !== 0,
-            'CLIENT_TRANSACTIONS' => ($capabilities & 0x00002000) !== 0,
-            'CLIENT_RESERVED' => ($capabilities & 0x00004000) !== 0,
-            'CLIENT_SECURE_CONNECTION' => ($capabilities & 0x00008000) !== 0,
-            'CLIENT_MULTI_STATEMENTS' => ($capabilities & 0x00010000) !== 0,
-            'CLIENT_MULTI_RESULTS' => ($capabilities & 0x00020000) !== 0,
-            'CLIENT_PS_MULTI_RESULTS' => ($capabilities & 0x00040000) !== 0,
-            'CLIENT_PLUGIN_AUTH' => ($capabilities & 0x00080000) !== 0,
-            'CLIENT_CONNECT_ATTRS' => ($capabilities & 0x00100000) !== 0,
-            'CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA' => ($capabilities & 0x00200000) !== 0,
-            'CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS' => ($capabilities & 0x00400000) !== 0,
-            'CLIENT_SESSION_TRACK' => ($capabilities & 0x00800000) !== 0,
-            'CLIENT_DEPRECATE_EOF' => ($capabilities & 0x01000000) !== 0,
+            // ========== 基础连接特性 (Basic Connection Features) ==========
+            'CLIENT_LONG_PASSWORD' => ($capabilities & 0x00000001) !== 0, // 支持长密码(>15字节)，协议基础特性
+            'CLIENT_FOUND_ROWS' => ($capabilities & 0x00000002) !== 0,    // 返回找到的行数而非受影响行数，影响COUNT(*)等查询结果
+            'CLIENT_LONG_FLAG' => ($capabilities & 0x00000004) !== 0,     // 支持长标志，扩展字段长度支持
+
+            // ========== 数据库连接特性 (Database Connection Features) ==========
+            'CLIENT_CONNECT_WITH_DB' => ($capabilities & 0x00000008) !== 0,  // 握手时可指定初始数据库，避免后续USE语句
+            'CLIENT_NO_SCHEMA' => ($capabilities & 0x00000010) !== 0,        // 保留位，不使用schema信息
+
+            // ========== 数据传输特性 (Data Transfer Features) ==========
+            'CLIENT_COMPRESS' => ($capabilities & 0x00000020) !== 0,          // 支持压缩协议，减少网络传输量
+            'CLIENT_ODBC' => ($capabilities & 0x00000040) !== 0,               // ODBC客户端特有标志，影响某些ODBC行为
+            'CLIENT_LOCAL_FILES' => ($capabilities & 0x00000080) !== 0,        // 支持LOAD DATA LOCAL语句，从客户端本地文件加载数据
+            'CLIENT_IGNORE_SPACE' => ($capabilities & 0x00000100) !== 0,       // 函数名后允许空格，影响SQL解析
+
+            // ========== 协议版本特性 (Protocol Version Features) ==========
+            'CLIENT_PROTOCOL_41' => ($capabilities & 0x00000200) !== 0,        // 使用MySQL 4.1+协议，支持更多特性
+            'CLIENT_INTERACTIVE' => ($capabilities & 0x00000400) !== 0,        // 交互式客户端，调整超时设置
+
+            // ========== 安全特性 (Security Features) ==========
+            'CLIENT_SSL' => ($capabilities & 0x00000800) !== 0,                // 支持SSL加密连接，保护数据传输安全
+            'CLIENT_IGNORE_SIGPIPE' => ($capabilities & 0x00001000) !== 0,     // 忽略SIGPIPE信号，Unix系统相关
+            'CLIENT_TRANSACTIONS' => ($capabilities & 0x00002000) !== 0,       // 支持事务，允许多语句事务操作
+            'CLIENT_RESERVED' => ($capabilities & 0x00004000) !== 0,           // 保留位，未来扩展使用
+            'CLIENT_SECURE_CONNECTION' => ($capabilities & 0x00008000) !== 0, // 支持安全连接，密码传输更安全
+
+            // ========== 多语句和结果集特性 (Multi-Statement & Result Set Features) ==========
+            'CLIENT_MULTI_STATEMENTS' => ($capabilities & 0x00010000) !== 0,     // 支持多语句查询，用分号分隔
+            'CLIENT_MULTI_RESULTS' => ($capabilities & 0x00020000) !== 0,        // 支持多结果集，从存储过程返回多个结果
+            'CLIENT_PS_MULTI_RESULTS' => ($capabilities & 0x00040000) !== 0,     // 预处理语句支持多结果集
+
+            // ========== 认证特性 (Authentication Features) ==========
+            'CLIENT_PLUGIN_AUTH' => ($capabilities & 0x00080000) !== 0,                           // 支持插件认证，扩展认证方式
+            'CLIENT_CONNECT_ATTRS' => ($capabilities & 0x00100000) !== 0,                         // 连接时发送客户端属性信息
+            'CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA' => ($capabilities & 0x00200000) !== 0,        // 插件认证使用长度编码数据
+            'CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS' => ($capabilities & 0x00400000) !== 0,          // 能处理过期密码，允许密码重置
+
+            // ========== 会话管理特性 (Session Management Features) ==========
+            'CLIENT_SESSION_TRACK' => ($capabilities & 0x00800000) !== 0,     // 支持会话状态跟踪，获取会话变量变化
+            'CLIENT_DEPRECATE_EOF' => ($capabilities & 0x01000000) !== 0,     // 弃用EOF包，使用OK包替代，提高性能
         ];
 
         $enabledCapabilities = array_filter($capabilityDetails, fn($enabled) => $enabled);
@@ -202,6 +220,7 @@ class MySQLHandshake
         $this->logger->info('客户端能力标志详情', [
             'enabled_capabilities' => array_keys($enabledCapabilities),
             'capability_count' => count($enabledCapabilities),
+            'enabledCapabilities' => $enabledCapabilities,
             'notable_features' => [
                 'supports_ssl' => $capabilityDetails['CLIENT_SSL'],
                 'supports_compression' => $capabilityDetails['CLIENT_COMPRESS'],
@@ -224,7 +243,7 @@ class MySQLHandshake
         $payloadLength = strlen($payload);
 
         // Capability Flags (4 bytes)
-        $capabilities = unpack('V', substr($payload, $offset, 4))[1];
+        $capabilities = $packet->getCapabilities();
         $offset += 4;
 
         // Max Packet Size (4 bytes)

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Protocol\MySql;
 
+use App\Proxy\Client\ClientType;
+
 class Packet
 {
     private int $length;
@@ -32,6 +34,43 @@ class Packet
     public function getPayload(): string
     {
         return $this->payload;
+    }
+
+    /**
+     * 分析客户端能力标志来识别客户端类型
+     */
+    public function analyzeCapabilities(int $charset): ClientType
+    {
+        $capabilities = $this->getCapabilities();
+        // Java Connector/J 的特征：
+        // - 通常支持 PLUGIN_AUTH
+        // - 字符集通常是 utf8mb4 (45) 或更高
+        if (($capabilities & 0x00080000) && // CLIENT_PLUGIN_AUTH
+            ($charset >= 45 && $charset <= 255)) {
+            return ClientType::JAVA_CONNECTOR;
+        }
+
+        // PHP PDO 的特征：
+        // - 支持 MULTI_STATEMENTS
+        // - 字符集通常是 utf8 (33) 或 utf8mb4 (45)
+        if (($capabilities & 0x00010000) && // CLIENT_MULTI_STATEMENTS
+            ($charset >= 33 && $charset <= 45)) {
+            return ClientType::PHP_PDO;
+        }
+
+        // MySQL 原生客户端的特征：
+        // - 支持基础功能，但通常不设置高级能力标志
+        if (($capabilities & 0x00000001) && // CLIENT_LONG_PASSWORD
+            !($capabilities & 0x00080000)) { // 没有 CLIENT_PLUGIN_AUTH
+            return ClientType::MYSQL_CLIENT;
+        }
+
+        return ClientType::UNKNOWN;
+    }
+
+    public function getCapabilities()
+    {
+        return unpack('V', substr($this->getPayload(), 0, 4))[1];
     }
 
     public static function fromString(string $data): self

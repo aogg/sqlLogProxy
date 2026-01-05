@@ -117,16 +117,33 @@ class MySQLProxyServiceOnReceiveTest extends \PHPUnit\Framework\TestCase
         $this->assertTrue(true);
     }
 
+    public function test_navicat_ReceiveWithActualAuthResponseData()
+    {
+        $this->testReceiveWithActualAuthResponseData(
+            'UAAAAYWmfwAAAABAIQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcm9vdAAUrAwuxwTD/vKZFBpftIZz7L4XchJteXNxbF9uYXRpdmVfcGFzc3dvcmQA',
+            'elRBQ01UWzR4ZS1FJj5jdzlwTnE1'
+        );
+    }
+
+    public function test_pdo_ReceiveWithActualAuthResponseData()
+    {
+        $this->testReceiveWithActualAuthResponseData(
+            'XAAAAY2iGwAAAADAIQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcm9vdAAUROa69lDbnWItMOUgfIKu6+JMzD5xaW1hbGxfcGx1cwBteXNxbF9uYXRpdmVfcGFzc3dvcmQA',
+            'MFdORGFdQl0iIzFFRj98OEVyMW5'
+        );
+    }
+
     /**
      * 测试：收到实际的认证响应数据（基于日志）
      */
-    public function testReceiveWithActualAuthResponseData()
+    public function testReceiveWithActualAuthResponseData($authResponseBase64 = null, $getAuthPluginData = null)
     {
         $server = $this->createMock(Server::class);
         $fd = 1;
         $reactorId = 0;
 
-        $authResponseBase64 = 'VgAAAQ+iLgD///8ALQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcm9vdAAUAa0Kzy/PwAiHK1dKGzuOtV88Ul9teXNxbABteXNxbF9uYXRpdmVfcGFzc3dvcmQA';
+        // jdbc
+        $authResponseBase64 ??= 'VgAAAQ+iLgD///8ALQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcm9vdAAUAa0Kzy/PwAiHK1dKGzuOtV88Ul9teXNxbABteXNxbF9uYXRpdmVfcGFzc3dvcmQA';
         $authResponseData = base64_decode($authResponseBase64);
 
         $this->assertNotFalse($authResponseData);
@@ -138,7 +155,7 @@ class MySQLProxyServiceOnReceiveTest extends \PHPUnit\Framework\TestCase
 
 
 
-        $getAuthPluginData = 'Kz80Km8hImcyLl4uRH5+ZU1cdFhG';
+        $getAuthPluginData ??= 'Kz80Km8hImcyLl4uRH5+ZU1cdFhG';
         $context->setAuthPluginData(base64_decode($getAuthPluginData));
 
 
@@ -148,14 +165,10 @@ class MySQLProxyServiceOnReceiveTest extends \PHPUnit\Framework\TestCase
 
 
         // 设置 connection logger 期望
-        $this->loggerMock->expects($this->atLeastOnce())
-            ->method('error')
-            ->with(
-                '处理数据包异常',
-                $this->callback(function ($context) use ($fd) {
-                    return !isset($context['error']);
-                })
-            );
+        $this->loggerMock->expects($this->never())
+            ->method('error');
+        $this->loggerMock->expects($this->never())
+            ->method('warning');
 
         $this->proxyService->onReceive($server, $fd, $reactorId, $authResponseData);
 

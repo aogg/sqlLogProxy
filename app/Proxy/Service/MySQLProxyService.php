@@ -21,6 +21,7 @@ use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
 use Swoole\Coroutine\Socket;
 use function Hyperf\Config\config;
+use function Hyperf\Support\env;
 
 /**
  * MySQL TLS 代理服务
@@ -106,6 +107,7 @@ class MySQLProxyService
      */
     public function handlePacket(ConnectionContext $context, Packet $packet): ?array
     {
+        /* @see \App\Protocol\MySql\Parser::parseCommand */
         $command = $packet->getCommand();
         $sequenceId = $packet->getSequenceId();
 
@@ -266,7 +268,7 @@ class MySQLProxyService
                 'auth_plugin_data_length' => strlen($context->getAuthPluginData()),
             ]);
 
-            $isValid = $this->authenticator->authenticate(
+            $isValid = $this->authenticator->setClientType($packet->analyzeCapabilities($charset))->authenticate(
                 $username,
                 $authResponse,
                 $context->getAuthPluginData(),
@@ -686,6 +688,11 @@ class MySQLProxyService
         $context = new ConnectionContext($clientId, $remoteIp, $remotePort);
         // 使用 21 字节的 auth_plugin_data（MySQL 5.7.44 要求）
         $authPluginData = $this->handshake->generateAuthPluginData(21);
+
+        if (env('PROXY_DEBUG_AUTH_PLUGIN_DATA')) {
+            $authPluginData = '123456789012345678901';
+        }
+
         $context->setAuthPluginData($authPluginData);
 
         LogEnum::base64DataByClientSendProxy->getLogger('onConnect')->debug('创建连接上下文', [
@@ -704,6 +711,10 @@ class MySQLProxyService
                     $this->logger->info('握手包已发送', [
                         'client_id' => $clientId,
                         'packet_length' => strlen($handshakePacket->toBytes()),
+                    ]);
+                    LogEnum::base64DataByClientSendProxy->getLogger('onConnect')->debug('创建连接上下文--握手包已发送', [
+                        'client_id' => $clientId,
+                        'handshake_packet' => base64_encode($handshakePacket->toBytes()),
                     ]);
                 } catch (\Throwable $e) {
                     $this->logger->error('发送握手包异常', [
@@ -737,8 +748,11 @@ class MySQLProxyService
         $clientId = (string) $fd;
         $context = isset($this->connections[$clientId]) ? $this->connections[$clientId] : null;
 
+        $dataBase64 = base64_encode($data);
+        $dataBase64Md5 = md5($dataBase64);
         LogEnum::base64DataByClientSendProxy->getLogger('onReceive')->debug('收到客户端数据', [
-            'data' => base64_encode($data),
+            'data_base64' => $dataBase64,
+            'data_base64_md5' => $dataBase64Md5,
             'getAuthPluginData' => $context ? base64_encode($context->getAuthPluginData()) : null,
             '$context' => serialize($context),
             'fd' => $fd,
@@ -802,11 +816,20 @@ class MySQLProxyService
                         'client_id' => $clientId,
                         'packet_index' => $index,
                         'packet_length' => strlen($packetBytes),
-                        'packet_hex' => bin2hex($packetBytes),
                         'sequence_id' => $responsePacket->getSequenceId(),
                         'payload_length' => $responsePacket->getLength(),
                     ]);
                     $server->send($fd, $packetBytes);
+                    LogEnum::base64DataByClientSendProxy->getLogger('onReceive')->debug('发送数据包', [
+                        'client_id' => $clientId,
+                        'packet_index' => $index,
+                        'packet_length' => strlen($packetBytes),
+                        'packet_hex' => bin2hex($packetBytes),
+                        'packet_base64' => base64_encode($packetBytes),
+                        'data_base64_md5' => $dataBase64Md5,
+                        'sequence_id' => $responsePacket->getSequenceId(),
+                        'payload_length' => $responsePacket->getLength(),
+                    ]);
                     // 添加短暂延迟，防止包发送太快导致客户端解析问题
                     usleep(1000); // 1 毫秒
                 }
@@ -815,7 +838,6 @@ class MySQLProxyService
         } catch (\Exception $e) {
             $this->logger->error('处理数据包异常', [
                 'client_id' => $clientId,
-                'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
 

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Proxy\Auth;
 
+use App\Proxy\Client\ClientType;
 use function Hyperf\Config\config;
 use Hyperf\Config\Annotation\Value;
 use Hyperf\Logger\LoggerFactory;
@@ -17,6 +18,8 @@ class ProxyAuthenticator
 {
     private LoggerInterface $logger;
     private array $proxyAccounts;
+
+    public ClientType $clientType;
 
     public function __construct(LoggerFactory $loggerFactory)
     {
@@ -103,7 +106,11 @@ class ProxyAuthenticator
     /**
      * 验证密码（使用 MySQL native password 认证算法）
      */
-    private function verifyPassword(string $clientAuthResponse, string $storedPassword, string $authPluginData): bool
+    private function verifyPassword(
+        string $clientAuthResponse,
+        string $storedPassword,
+        string $authPluginData
+    ): bool
     {
         // 如果存储的密码为空，检查客户端认证响应是否也为空
         if ($storedPassword === '') {
@@ -116,10 +123,12 @@ class ProxyAuthenticator
         }
 
         // 计算期望的认证响应
-        $expectedResponse = $this->calculateAuthResponse($storedPassword, $authPluginData);
+        $expectedResponse = $this->clientType->checkAuth($storedPassword, $authPluginData);
+        // $expectedResponse = $this->calculateAuthResponse($storedPassword, $authPluginData);
 
         // 比较认证响应
-        $isValid = hash_equals($expectedResponse, $clientAuthResponse);
+        // $isValid = hash_equals(($expectedResponse), $clientAuthResponse);
+        $isValid = $expectedResponse === $clientAuthResponse;
 
         $this->logger->debug('密码验证详情', [
             // 以 hex 形式记录二进制内容，便于对比与调试（生产请谨慎）
@@ -134,33 +143,6 @@ class ProxyAuthenticator
         return $isValid;
     }
 
-    /**
-     * 计算 MySQL native password 认证响应
-     * 注意：MySQL客户端只使用auth_plugin_data的前20字节进行认证
-     */
-    private function calculateAuthResponse(string $password, string $authPluginData): string
-    {
-        if ($password === '') {
-            return '';
-        }
-
-        // MySQL客户端只使用前20字节的auth_plugin_data进行认证
-        $authDataForClient = substr($authPluginData, 0, 20);
-
-        // SHA1(password)
-        $hash1 = sha1($password, true);
-
-        // SHA1(SHA1(password))
-        $hash2 = sha1($hash1, true);
-
-        // SHA1(auth_plugin_data[0..19] + SHA1(SHA1(password)))
-        $hash3 = sha1($authDataForClient . $hash2, true);
-
-        // XOR: SHA1(password) ^ SHA1(auth_plugin_data[0..19] + SHA1(SHA1(password)))
-        $response = $hash1 ^ $hash3;
-
-        return $response;
-    }
 
     /**
      * 获取所有代理账号（用于调试和管理）
@@ -196,5 +178,11 @@ class ProxyAuthenticator
     {
         $account = $this->findAccount($username, $database);
         return $account !== null;
+    }
+
+    public function setClientType(ClientType $clientType): self
+    {
+        $this->clientType = $clientType;
+        return $this;
     }
 }

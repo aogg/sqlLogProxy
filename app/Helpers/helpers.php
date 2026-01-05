@@ -1,5 +1,6 @@
 <?php
 
+include_once __DIR__ . '/helper_SMProxy.php';
 
 /**
  * 复制目录

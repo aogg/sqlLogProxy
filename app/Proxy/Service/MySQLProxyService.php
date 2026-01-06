@@ -756,7 +756,12 @@ class MySQLProxyService
 
         $dataBase64 = base64_encode($data);
         $dataBase64Md5 = md5($dataBase64);
+
+        // 提取可读文本，过滤乱码
+        $readableText = $this->extractReadableText($data);
+
         LogEnum::base64DataByClientSendProxy->getLogger('onReceive')->debug('收到客户端数据', [
+            'readable_text' => $readableText, // 过滤乱码后的可读文本
             'data_base64' => $dataBase64,
             'data_base64_md5' => $dataBase64Md5,
             'getAuthPluginData' => $context ? base64_encode($context->getAuthPluginData()) : null,
@@ -853,6 +858,71 @@ class MySQLProxyService
                 $server->send($fd, $packet->toBytes());
             }
         }
+    }
+
+    /**
+     * 从二进制数据中提取可显示的文本，过滤乱码
+     */
+    private function extractReadableText(string $data): string
+    {
+        $readable = '';
+
+        // 遍历每个字节
+        for ($i = 0; $i < strlen($data); $i++) {
+            $byte = ord($data[$i]);
+
+            // 可打印的 ASCII 字符 (32-126)
+            if ($byte >= 32 && $byte <= 126) {
+                $readable .= $data[$i];
+            }
+            // 制表符、换行符等控制字符 (9-13)
+            elseif ($byte >= 9 && $byte <= 13) {
+                $readable .= $data[$i];
+            }
+            // 尝试检测 UTF-8 多字节字符
+            elseif ($byte >= 0xC0 && $byte <= 0xDF) {
+                // 2字节UTF-8
+                if ($i + 1 < strlen($data)) {
+                    $byte2 = ord($data[$i + 1]);
+                    if ($byte2 >= 0x80 && $byte2 <= 0xBF) {
+                        $char = $data[$i] . $data[$i + 1];
+                        if (mb_check_encoding($char, 'UTF-8')) {
+                            $readable .= $char;
+                            $i++;
+                        }
+                    }
+                }
+            } elseif ($byte >= 0xE0 && $byte <= 0xEF) {
+                // 3字节UTF-8
+                if ($i + 2 < strlen($data)) {
+                    $byte2 = ord($data[$i + 1]);
+                    $byte3 = ord($data[$i + 2]);
+                    if ($byte2 >= 0x80 && $byte2 <= 0xBF && $byte3 >= 0x80 && $byte3 <= 0xBF) {
+                        $char = $data[$i] . $data[$i + 1] . $data[$i + 2];
+                        if (mb_check_encoding($char, 'UTF-8')) {
+                            $readable .= $char;
+                            $i += 2;
+                        }
+                    }
+                }
+            } elseif ($byte >= 0xF0 && $byte <= 0xF7) {
+                // 4字节UTF-8
+                if ($i + 3 < strlen($data)) {
+                    $byte2 = ord($data[$i + 1]);
+                    $byte3 = ord($data[$i + 2]);
+                    $byte4 = ord($data[$i + 3]);
+                    if ($byte2 >= 0x80 && $byte2 <= 0xBF && $byte3 >= 0x80 && $byte3 <= 0xBF && $byte4 >= 0x80 && $byte4 <= 0xBF) {
+                        $char = $data[$i] . $data[$i + 1] . $data[$i + 2] . $data[$i + 3];
+                        if (mb_check_encoding($char, 'UTF-8')) {
+                            $readable .= $char;
+                            $i += 3;
+                        }
+                    }
+                }
+            }
+        }
+
+        return $readable;
     }
 
     /**

@@ -212,6 +212,12 @@ class MySQLProxyService
                 'client_capabilities' => sprintf('0x%08x', $authData['capabilities'] ?? 0),
             ]);
 
+            // 保存客户端能力标志到上下文
+            $context->setClientCapabilities([
+                'capabilities' => $authData['capabilities'] ?? 0,
+                'deprecate_eof' => (($authData['capabilities'] ?? 0) & 0x01000000) !== 0,
+            ]);
+
             // 当启用 CLIENT_PLUGIN_AUTH 时，第一个包的 auth_response 可能为空
             // 实际的认证响应会在第二个包（sequence_id=2）中发送
             // 检查是否是第一个包（auth_response_length=0 且已经解析出了用户名）
@@ -384,8 +390,8 @@ class MySQLProxyService
             'sql' => $sql->sql,
         ]);
 
-        // 使用后端执行器执行 SQL
-        $packets = $this->executor->execute($sql, $context->getDatabase());
+        // 使用后端执行器执行 SQL，传入客户端上下文
+        $packets = $this->executor->execute($sql, $context->getDatabase(), $context);
 
         // 调整包的sequence_id，从客户端命令包的sequence_id + 1开始
         $adjustedPackets = [];

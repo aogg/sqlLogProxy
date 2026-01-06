@@ -8,6 +8,7 @@ use App\Helpers\PHPSQLParserHelper;
 use Hyperf\DbConnection\Db;
 use App\Protocol\MySql\Packet;
 use App\Protocol\MySql\Parser;
+use App\Protocol\ConnectionContext;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
 
@@ -34,9 +35,10 @@ class BackendExecutor
      *
      * @param PHPSQLParserHelper $sql 要执行的 SQL 语句
      * @param string|null $database 要使用的数据库名
+     * @param ConnectionContext|null $context 客户端连接上下文
      * @return array 执行结果，包含 MySQL 协议包
      */
-    public function execute(PHPSQLParserHelper $sql, ?string $database = null): array
+    public function execute(PHPSQLParserHelper $sql, ?string $database = null, ?ConnectionContext $context = null): array
     {
         $startTime = microtime(true);
         $retryCount = 0;
@@ -115,7 +117,7 @@ class BackendExecutor
                     'result_summary' => $resultSummary,
                 ]);
 
-                return $this->createResultSetPackets($result);
+                return $this->createResultSetPackets($result, $context);
             } else {
                 // 对于其他查询（如 INSERT, UPDATE, DELETE），使用 statement 方法
                 $affectedRows = $connection->statement($sql->sql);
@@ -253,14 +255,25 @@ class BackendExecutor
 
     /**
      * 创建结果集包
+     *
+     * @param array $result 查询结果
+     * @param ConnectionContext|null $context 客户端连接上下文
+     * @return array MySQL协议包数组
      */
-    private function createResultSetPackets(array $result): array
+    private function createResultSetPackets(array $result, ?ConnectionContext $context = null): array
     {
         $packets = [];
 
         if (empty($result)) {
             // 空结果集
-            return $this->createEmptyResultSet();
+            return $this->createEmptyResultSet($context);
+        }
+
+        // 检查客户端是否支持 CLIENT_DEPRECATE_EOF
+        $deprecateEof = false;
+        if ($context !== null) {
+            $clientCapabilities = $context->getClientCapabilities();
+            $deprecateEof = $clientCapabilities['deprecate_eof'] ?? false;
         }
 
         // 获取列信息
@@ -277,8 +290,14 @@ class BackendExecutor
             $packets[] = Packet::create($sequenceId++, $this->createColumnDefinition($columnName));
         }
 
-        // EOF Packet after columns
-        $packets[] = Packet::create($sequenceId++, $this->createEofPacket()); // EOF
+        // EOF/OK Packet after columns
+        if ($deprecateEof) {
+            // 客户端支持 CLIENT_DEPRECATE_EOF，发送 OK 包
+            $packets[] = Packet::create($sequenceId++, $this->createOkPayload(0, 0, 0x0002, 0));
+        } else {
+            // 客户端不支持，发送 EOF 包
+            $packets[] = Packet::create($sequenceId++, $this->createEofPacket());
+        }
 
         // Row Data Packets
         foreach ($result as $row) {
@@ -290,32 +309,79 @@ class BackendExecutor
             $packets[] = Packet::create($sequenceId++, $rowData);
         }
 
-        // EOF Packet after rows
-        $packets[] = Packet::create($sequenceId++, $this->createEofPacket()); // EOF
+        // EOF/OK Packet after rows
+        if ($deprecateEof) {
+            // 客户端支持 CLIENT_DEPRECATE_EOF，发送 OK 包
+            $packets[] = Packet::create($sequenceId++, $this->createOkPayload(0, 0, 0x0002, 0));
+        } else {
+            // 客户端不支持，发送 EOF 包
+            $packets[] = Packet::create($sequenceId++, $this->createEofPacket());
+        }
 
         return $packets;
     }
 
     /**
      * 创建EOF包
+     *
+     * MySQL EOF包格式：
+     * - 0xfe (1字节) - EOF标记
+     * - warnings (2字节) - 警告计数
+     * - status_flags (2字节) - 状态标志
      */
     private function createEofPacket(): string
     {
-        // MySQL 5.7 EOF包格式：只包含EOF标记
-        // 在某些客户端实现中，EOF包只需要0xfe一个字节
-        return chr(0xfe);
+        $payload = chr(0xfe); // EOF marker
+        $payload .= pack('v', 0); // warning count (2字节)
+        $payload .= pack('v', 0); // status flags (2字节)
+        return $payload;
+    }
+
+    /**
+     * 创建OK包payload
+     *
+     * @param int $affectedRows 受影响的行数
+     * @param int $lastInsertId 最后插入ID
+     * @param int $statusFlags 状态标志，0x0002表示无结果集
+     * @param int $warnings 警告数
+     * @return string OK包payload
+     */
+    private function createOkPayload(int $affectedRows = 0, int $lastInsertId = 0, int $statusFlags = 0, int $warnings = 0): string
+    {
+        $payload = chr(0x00); // OK packet header
+        $payload .= $this->encodeLength($affectedRows); // affected_rows
+        $payload .= $this->encodeLength($lastInsertId); // last_insert_id
+        $payload .= pack('v', $statusFlags); // status_flags
+        $payload .= pack('v', $warnings); // warnings
+        return $payload;
     }
 
     /**
      * 创建空结果集
+     *
+     * @param ConnectionContext|null $context 客户端连接上下文
+     * @return array MySQL协议包数组
      */
-    private function createEmptyResultSet(): array
+    private function createEmptyResultSet(?ConnectionContext $context = null): array
     {
+        // 检查客户端是否支持 CLIENT_DEPRECATE_EOF
+        $deprecateEof = false;
+        if ($context !== null) {
+            $clientCapabilities = $context->getClientCapabilities();
+            $deprecateEof = $clientCapabilities['deprecate_eof'] ?? false;
+        }
+
         // Column count: 0
         $packets = [Packet::create(0, $this->encodeLength(0))];
 
-        // EOF
-        $packets[] = Packet::create(1, $this->createEofPacket());
+        // EOF/OK packet
+        if ($deprecateEof) {
+            // 客户端支持 CLIENT_DEPRECATE_EOF，发送 OK 包
+            $packets[] = Packet::create(1, $this->createOkPayload(0, 0, 0x0002, 0));
+        } else {
+            // 客户端不支持，发送 EOF 包
+            $packets[] = Packet::create(1, $this->createEofPacket());
+        }
 
         return $packets;
     }
@@ -627,7 +693,7 @@ class BackendExecutor
                             'result_count' => count($result),
                         ]);
 
-                        return $this->createResultSetPackets($result);
+                        return $this->createResultSetPackets($result, $context);
                     }
                 }
             }

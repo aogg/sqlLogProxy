@@ -72,12 +72,12 @@ class BackendExecutor
                 }
 
             // 如果指定了数据库，先切换到该数据库
-            if ($database !== null && $database !== '') {
-                $connection->statement("USE `{$database}`");
-                $this->logger->debug('已切换到数据库', [
-                    'database' => $database,
-                ]);
-            }
+            // if ($database !== null && $database !== '') {
+            //     $connection->statement("USE `{$database}`");
+            //     $this->logger->debug('已切换到数据库', [
+            //         'database' => $database,
+            //     ]);
+            // }
 
             // 对于 SELECT 查询，使用 select 方法
             // 支持前置注释（例如 MySQL Connector/J 会在前面带注释），所以使用正则去除注释后判断

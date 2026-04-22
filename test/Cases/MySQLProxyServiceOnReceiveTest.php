@@ -125,18 +125,19 @@ class MySQLProxyServiceOnReceiveTest extends \PHPUnit\Framework\TestCase
         );
     }
 
-    public function test_pdo_ReceiveWithActualAuthResponseData()
+    public function test_pdo_tables_ReceiveWithActualAuthResponseData()
     {
         $this->testReceiveWithActualAuthResponseData(
-            'XAAAAY2iGwAAAADAIQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcm9vdAAUROa69lDbnWItMOUgfIKu6+JMzD5xaW1hbGxfcGx1cwBteXNxbF9uYXRpdmVfcGFzc3dvcmQA',
-            'MFdORGFdQl0iIzFFRj98OEVyMW5'
+            'HwAAAANTRUxFQ1QgKiBmcm9tIFRBQkxFUyBsaW1pdCAyMDA=',
+            'L0ItPHd4WG1BX1kwWkc2Xy89fVtP',
+            'information_schema'
         );
     }
 
     /**
      * 测试：收到实际的认证响应数据（基于日志）
      */
-    public function testReceiveWithActualAuthResponseData($authResponseBase64 = null, $getAuthPluginData = null)
+    public function testReceiveWithActualAuthResponseData($authResponseBase64 = null, $getAuthPluginData = null, $database = 'mysql')
     {
         $server = $this->createMock(Server::class);
         $fd = 1;
@@ -151,7 +152,8 @@ class MySQLProxyServiceOnReceiveTest extends \PHPUnit\Framework\TestCase
 
         $context = $this->addConnectionContext($fd, $server);
         $context->setUsername('root');
-        $context->setDatabase('mysql');
+        $context->setDatabase($database);
+        $context->setAuthenticated(true);
 
 
 
